@@ -5,7 +5,7 @@ import psycopg2.extras
 from context.db import get_db_connection
 from context.results import save_result
 from sources.github import get_pr_diff
-from sources.runtime import get_runtime_flow, get_latest_trace_id, parse_log
+from sources.runtime import get_runtime_flow, get_latest_trace_id, get_db_quality, parse_log
 from sources.confluence import get_design_by_flow
 from agent.core import run_agent
 from agent.prompt import PROMPT_PRE_MERGE, PROMPT_POST_DEPLOY
@@ -38,7 +38,7 @@ def list_analysis():
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
-            SELECT id, flow_id, analysis_type, verdict, created_at
+            SELECT id, flow_id, analysis_type, verdict, trace_id, created_at
             FROM analysis_results
             ORDER BY created_at DESC
         """)
@@ -56,7 +56,7 @@ def flow_analysis(flow_id):
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
-            SELECT id, flow_id, analysis_type, verdict, detail, runtime_flow, created_at
+            SELECT id, flow_id, analysis_type, verdict, detail, runtime_flow, trace_id, created_at
             FROM analysis_results
             WHERE flow_id = %s
             ORDER BY created_at DESC
@@ -70,6 +70,39 @@ def flow_analysis(flow_id):
         return jsonify(dict(row))
     finally:
         conn.close()
+
+
+@app.route("/api/flows/<flow_id>/db-quality", methods=["GET"])
+def flow_db_quality(flow_id):
+    """Trả thông tin chất lượng database trích từ trace (span SQL tags).
+
+    Không gọi agent — chỉ đọc tag db.* từ span, trả JSON trực tiếp.
+    """
+    trace_id = request.args.get("trace_id", "").strip()
+
+    # Nếu không truyền trace_id, lấy trace mới nhất
+    if not trace_id:
+        service = request.args.get("service", "ewallet-payment-order")
+        trace_id = get_latest_trace_id(service=service)
+        if not trace_id:
+            return jsonify({
+                "flow_id": flow_id,
+                "trace_id": None,
+                "total_queries": 0,
+                "alert_count": 0,
+                "db_quality": []
+            })
+
+    db_quality = get_db_quality(trace_id)
+    alert_count = sum(1 for q in db_quality if q["status"] == "alert")
+
+    return jsonify({
+        "flow_id": flow_id,
+        "trace_id": trace_id,
+        "total_queries": len(db_quality),
+        "alert_count": alert_count,
+        "db_quality": db_quality
+    })
 
 
 # ========== Luồng 1: Pre-merge (GitHub Webhook) ==========
@@ -132,17 +165,36 @@ def runtime_check():
     Nhận trace_id (hoặc tự lấy mới nhất qua get_latest_trace_id), gọi get_runtime_flow,
     chạy agent với PROMPT_POST_DEPLOY + design, lưu kết quả qua save_result, trả JSON.
     """
-    payload = request.get_json(silent=True) or {}
+    # Đọc payload từ request body (hỗ trợ request.json, get_json chuẩn, hoặc force parse)
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        try:
+            payload = request.get_json(force=True, silent=True)
+        except Exception:
+            payload = None
+    if not isinstance(payload, dict):
+        payload = {}
 
     flow_id = payload.get("flow_id", "F1") if isinstance(payload, dict) else "F1"
-    trace_id = payload.get("trace_id") if isinstance(payload, dict) else None
+    raw_trace_id = payload.get("trace_id")
+    if raw_trace_id is None and request.form:
+        raw_trace_id = request.form.get("trace_id")
+
+    # Chuẩn hóa trace_id: chỉ nhận nếu có giá trị (không None, không rỗng)
+    trace_id = str(raw_trace_id).strip() if raw_trace_id is not None else None
+    if not trace_id:
+        trace_id = None
+
     service = payload.get("service", "ewallet-payment-order") if isinstance(payload, dict) else "ewallet-payment-order"
     operation = payload.get("operation") if isinstance(payload, dict) else None
 
     runtime_flow = ""
 
-    # Nếu không có trace_id, tự động lấy trace mới nhất từ Jaeger
+    # Logic chọn trace_id:
+    # - NẾU trace_id có giá trị: DÙNG ĐÚNG trace_id đó, TUYỆT ĐỐI KHÔNG gọi get_latest_trace_id.
+    # - NẾU trace_id rỗng/không truyền: mới gọi get_latest_trace_id để lấy trace mới nhất.
     if not trace_id and service:
+        print(f"\n[Post-deploy] Không có trace_id trong request, đang tự động lấy trace mới nhất của service '{service}' từ Jaeger...")
         trace_id = get_latest_trace_id(service=service, operation=operation)
 
     if trace_id:
@@ -189,7 +241,8 @@ Hãy đối chiếu và kết luận."""
         analysis_type="post_deploy",
         verdict=verdict,
         detail=conclusion,
-        runtime_flow=runtime_flow
+        runtime_flow=runtime_flow,
+        trace_id=trace_id
     )
 
     print("\n========== KẾT LUẬN POST-DEPLOY ==========")

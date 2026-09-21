@@ -16,6 +16,34 @@ NOISE_PREFIXES = [
 NOISE_EXACT = ["orderdb", "paymentdb", "notifdb", "thirdpartydb"]
 
 
+def _fetch_trace(trace_id: str):
+    """Gọi Jaeger API lấy trace data thô (dict), dùng chung cho nhiều hàm.
+
+    Args:
+        trace_id (str): Mã trace ID trong hệ thống Jaeger.
+
+    Returns:
+        tuple: (trace_dict, error_message). Nếu thành công thì trace_dict là dict
+               chứa spans + processes, error_message là None. Nếu lỗi thì trace_dict
+               là None, error_message mô tả lỗi.
+    """
+    url = f"{config.JAEGER_URL}/api/traces/{trace_id}"
+    try:
+        response = requests.get(url, timeout=10)
+        if response.status_code == 404:
+            return None, f"Không tìm thấy trace với ID: {trace_id} trong Jaeger."
+        response.raise_for_status()
+        data = response.json()
+    except requests.exceptions.RequestException as e:
+        return None, f"Lỗi khi kết nối tới Jaeger ({url}): {str(e)}"
+
+    traces = data.get("data", [])
+    if not traces:
+        return None, f"Không tìm thấy dữ liệu trace cho trace_id: {trace_id}"
+
+    return traces[0], None
+
+
 def is_noise(operation: str) -> bool:
     """Kiểm tra một operation/span có phải là span kỹ thuật nhiễu hay không."""
     if not operation:
@@ -34,21 +62,10 @@ def get_runtime_flow(trace_id: str) -> str:
     Returns:
         str: Danh sách đánh số các bước nghiệp vụ thực tế (kèm [LỖI] nếu có).
     """
-    url = f"{config.JAEGER_URL}/api/traces/{trace_id}"
-    try:
-        response = requests.get(url, timeout=10)
-        if response.status_code == 404:
-            return f"Không tìm thấy trace với ID: {trace_id} trong Jaeger."
-        response.raise_for_status()
-        data = response.json()
-    except requests.exceptions.RequestException as e:
-        return f"Lỗi khi kết nối tới Jaeger ({url}): {str(e)}"
+    trace, error = _fetch_trace(trace_id)
+    if error:
+        return error
 
-    traces = data.get("data", [])
-    if not traces:
-        return f"Không tìm thấy dữ liệu trace cho trace_id: {trace_id}"
-
-    trace = traces[0]
     spans = trace.get("spans", [])
     processes = trace.get("processes", {})
 
@@ -84,6 +101,124 @@ def get_runtime_flow(trace_id: str) -> str:
         return "Không có bước nghiệp vụ nào sau khi lọc bỏ span nhiễu."
 
     return "\n".join(f"{i}. {l}" for i, l in enumerate(lines, 1))
+
+
+def get_db_quality(trace_id: str) -> list:
+    """Trích xuất và gom nhóm thông tin chất lượng database từ các span SQL trong trace.
+
+    Gom các query giống nhau theo (operation, table, statement), tính số lần gọi (call_count),
+    tổng thời gian (total_ms), thời gian lớn nhất (max_ms), và phát hiện N+1 (call_count >= 3).
+
+    Args:
+        trace_id (str): Mã trace ID trong hệ thống Jaeger.
+
+    Returns:
+        list: Danh sách dict mô tả các nhóm query SQL, sắp xếp alert lên đầu,
+              rồi theo call_count giảm dần, rồi total_ms giảm dần.
+              Trả list rỗng nếu không tìm thấy trace hoặc không có span SQL nào.
+    """
+    trace, error = _fetch_trace(trace_id)
+    if error:
+        return []
+
+    spans = trace.get("spans", [])
+    groups = {}
+
+    for s in spans:
+        # Xây dict key→value từ mảng tags của Jaeger
+        tags = {t.get("key"): t.get("value") for t in s.get("tags", [])}
+
+        # Chỉ lấy span có tag db.statement (span SQL)
+        raw_statement = tags.get("db.statement")
+        if not raw_statement:
+            continue
+
+        statement = str(raw_statement).strip()
+        table = str(tags.get("db.sql.table") or tags.get("db.table") or "").strip()
+        operation = str(tags.get("db.operation") or "").strip().upper()
+        if not operation and statement:
+            operation = statement.split()[0].upper()
+
+        # Đọc execution_time_ms an toàn (từ tag db.execution_time_ms hoặc duration span tính bằng ms)
+        raw_exec = tags.get("db.execution_time_ms")
+        if raw_exec is not None:
+            try:
+                execution_time_ms = float(raw_exec)
+            except (ValueError, TypeError):
+                execution_time_ms = 0.0
+        elif "duration" in s:
+            try:
+                execution_time_ms = round(float(s["duration"]) / 1000.0, 2)
+            except (ValueError, TypeError):
+                execution_time_ms = 0.0
+        else:
+            execution_time_ms = 0.0
+
+        # Đọc quality_flags: tách chuỗi theo dấu phẩy, strip khoảng trắng
+        raw_flags = str(tags.get("db.quality_flags", ""))
+        if raw_flags.strip():
+            span_flags = [f.strip() for f in raw_flags.split(",") if f.strip()]
+        else:
+            span_flags = []
+
+        # Khóa gom: operation + table + statement
+        group_key = (operation, table, statement)
+        if group_key not in groups:
+            groups[group_key] = {
+                "statement": statement,
+                "table": table,
+                "operation": operation,
+                "call_count": 0,
+                "total_ms": 0.0,
+                "max_ms": 0.0,
+                "raw_flags": [],
+            }
+
+        g = groups[group_key]
+        g["call_count"] += 1
+        g["total_ms"] += execution_time_ms
+        if execution_time_ms > g["max_ms"] or g["call_count"] == 1:
+            g["max_ms"] = execution_time_ms
+
+        for f in span_flags:
+            if f != "OK" and f not in g["raw_flags"]:
+                g["raw_flags"].append(f)
+
+    results = []
+    for g in groups.values():
+        call_count = g["call_count"]
+        flags = list(g["raw_flags"])
+
+        # Phát hiện N+1: nếu call_count >= 3 cho cùng một query -> thêm cờ N+1_SUSPECT
+        if call_count >= 3 and "N+1_SUSPECT" not in flags:
+            flags.append("N+1_SUSPECT")
+
+        # Xác định status: có bất kỳ cờ khác OK hoặc call_count >= 3 -> alert
+        if flags:
+            status = "alert"
+        else:
+            flags = ["OK"]
+            status = "ok"
+
+        results.append({
+            "statement": g["statement"],
+            "table": g["table"],
+            "operation": g["operation"],
+            "call_count": call_count,
+            "total_ms": round(g["total_ms"], 2),
+            "max_ms": round(g["max_ms"], 2),
+            "flags": flags,
+            "status": status,
+        })
+
+    # Sắp xếp: status "alert" lên đầu, rồi theo call_count giảm dần, rồi total_ms giảm dần
+    results.sort(key=lambda q: (
+        0 if q["status"] == "alert" else 1,
+        -q["call_count"],
+        -q["total_ms"]
+    ))
+
+    return results
 
 
 def get_latest_trace_id(service: str, operation: str = None) -> str:
