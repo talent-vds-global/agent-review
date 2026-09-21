@@ -6,8 +6,9 @@ from context.db import get_db_connection
 from context.results import save_result
 from sources.github import get_pr_diff
 from sources.runtime import get_runtime_flow, get_latest_trace_id, parse_log
+from sources.confluence import get_design_by_flow
 from agent.core import run_agent
-from agent.prompt import PROMPT_PRE_MERGE, PROMPT_POST_DEPLOY, DESIGN_F1
+from agent.prompt import PROMPT_PRE_MERGE, PROMPT_POST_DEPLOY
 
 app = Flask(__name__)
 CORS(app)  # Cho phép dashboard (cổng khác) gọi API
@@ -164,8 +165,8 @@ def runtime_check():
                 "message": f"Không tìm thấy trace_id và không có dữ liệu log cho service '{service}'"
             }), 400
 
-    # Lấy tài liệu thiết kế (hiện tại dùng DESIGN_F1)
-    design = DESIGN_F1 if flow_id == "F1" else f"Thiết kế của luồng {flow_id}"
+    # Lấy tài liệu thiết kế từ Confluence
+    design = get_design_by_flow(flow_id)
 
     user_input = f"""THIẾT KẾ:
 {design}
