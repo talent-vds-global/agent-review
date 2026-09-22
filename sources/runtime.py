@@ -263,6 +263,20 @@ def get_spans(trace_id: str) -> list:
     return normalize_spans(fetch_trace(trace_id))
 
 
+def trace_window_us(trace: dict) -> tuple:
+    """Cửa sổ thời gian tuyệt đối của trace: (start_us, end_us) micro giây từ epoch.
+
+    `normalize_spans` chỉ giữ thời gian **tương đối** (start_ms so với span sớm nhất) nên không
+    tra được log của cùng khoảng thời gian. Hàm này đọc lại mốc tuyệt đối từ trace thô.
+    """
+    spans = trace.get("spans", []) or []
+    if not spans:
+        return 0, 0
+    start = min(s.get("startTime", 0) for s in spans)
+    end = max(s.get("startTime", 0) + s.get("duration", 0) for s in spans)
+    return start, end
+
+
 # ==========================================================================
 # Tầng 3 — chuỗi bước nghiệp vụ dạng text (đầu vào cho LLM)
 # ==========================================================================
@@ -437,8 +451,11 @@ def build_timeline(trace: dict, include_db: bool = False) -> dict:
             entry["db_calls"] += 1
 
     total = max((s["start_ms"] + s["duration_ms"] for s in spans), default=0)
+    start_us, end_us = trace_window_us(trace)
     return {
         "trace_id": trace.get("traceID", ""),
+        "started_at_ms": round(start_us / 1000) if start_us else 0,
+        "ended_at_ms": round(end_us / 1000) if end_us else 0,
         "total_duration_ms": round(total, 1),
         "span_count": len(spans),
         "step_count": len(steps),

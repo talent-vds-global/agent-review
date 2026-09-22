@@ -83,6 +83,33 @@ def get_latest_flow_result(flow_id: str) -> dict:
             conn.close()
 
 
+def get_latest_result_per_flow() -> list:
+    """Kết quả phân tích mới nhất của **từng** flow, trong một lần truy vấn.
+
+    Màn tổng quan cần bảng đối chiếu của mọi flow để cộng số liệu; gọi
+    `get_latest_flow_result` theo vòng lặp thì mỗi flow một kết nối. Không trả `detail`
+    (báo cáo của agent, rất dài) — phần đó chỉ đọc khi người dùng mở đúng một flow.
+
+    Returns:
+        list[dict]: mỗi flow một bản ghi {id, flow_id, analysis_type, verdict, trace_id,
+        evidence, created_at}, sắp theo flow_id.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT DISTINCT ON (flow_id)
+                       id, flow_id, analysis_type, verdict, trace_id, evidence, created_at
+                FROM analysis_results
+                ORDER BY flow_id, created_at DESC;
+            """)
+            return [dict(r) for r in cur.fetchall()]
+    finally:
+        if conn:
+            conn.close()
+
+
 def list_analysis_results(limit: int = 50) -> list:
     """Lấy danh sách tất cả các kết quả phân tích gần nhất.
 

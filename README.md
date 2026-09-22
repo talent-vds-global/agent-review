@@ -13,8 +13,9 @@ và một Agent Core (Google Gemini).
 | Đầu ra | JSON trả về cho caller | JSON **và** lưu vào bảng `analysis_results`, kèm bảng bằng chứng từng bước |
 
 Kết quả của Luồng 2 được [agent-review-dashboard](https://github.com/talent-vds-global/agent-review-dashboard)
-đọc lên qua `GET /api/analysis` và `GET /api/flows/<flow_id>/analysis`, cộng thêm ba endpoint cho báo
-cáo chi tiết: bảng đối chiếu tài liệu, sơ đồ trace rút gọn và số liệu chất lượng database (§6).
+đọc lên qua `GET /api/overview` (màn tổng quan chia theo service), `GET /api/analysis` và
+`GET /api/flows/<flow_id>/analysis`, cộng thêm các endpoint cho báo cáo chi tiết: bảng đối chiếu tài
+liệu, số liệu của trace (kèm log) và chất lượng database (§6).
 
 ---
 
@@ -50,11 +51,15 @@ graph TD
     EV --> SAVE
     SAVE --> DB
     DB --> API["GET /api/analysis<br/>GET /api/flows/:id/analysis<br/>GET /api/flows/:id/evidence"]
+    DB --> OV["analysis/overview.py<br/>GET /api/overview"]
     FD --> FAPI["GET /api/flows<br/>GET /api/traces/:id/flow"]
     FAPI --> UI
-    JG --> TL["GET /api/traces/:id/timeline"]
+    JG --> TL["GET /api/traces/:id/timeline<br/>GET /api/traces/:id/metrics"]
+    LK[("Loki :13100<br/>log theo trace_id")] --> TL
     DQ[("db-quality dashboards<br/>:19082-19085")] --> DQAPI["GET /api/db-quality"]
+    DQAPI --> OV
     API --> UI["agent-review-dashboard"]
+    OV --> UI
     TL --> UI
     DQAPI --> UI
 ```
@@ -435,6 +440,39 @@ và muốn biết trace cũ có còn khớp không.
 
 Trả `{ trace_id, total_duration_ms, span_count, step_count, services[], steps[], db_rollup[] }`.
 Tham số `db=0` để bỏ chi tiết truy vấn của từng bước. Quy tắc rút gọn ở §8.
+
+### `GET /api/traces/<trace_id>/metrics` — số liệu của một trace (không kèm danh sách bước)
+
+Trả `{ total_duration_ms, span_count, step_count, error_count, services[], db{}, slowest_steps[],
+error_steps[], logs{} }`. Khác `/timeline` ở chỗ **không** trả `steps[]`: dashboard không vẽ lại
+trace nữa, chỉ hiện số liệu trả lời "chạy hết bao lâu, thu được bao nhiêu span và log, có lời gọi
+nào lỗi".
+
+`logs` lấy từ Loki bằng chính `trace_id` (OTel Java Agent gắn context vào MDC nên mỗi dòng log mang
+sẵn `trace_id`): `{ available, total, by_level, error_count, warn_count, errors[], explore_url }`.
+Cửa sổ truy vấn lấy từ mốc thời gian thật của trace. Loki không chạy thì `available=false` kèm lý
+do — các số liệu còn lại vẫn trả đủ. Tham số `logs=0` để bỏ qua bước này. Cấu hình `LOKI_URL`,
+`GRAFANA_URL` (dựng link "mở log trong Grafana").
+
+### `GET /api/overview` — tổng quan chất lượng toàn hệ thống, chia theo service
+
+Gộp bảng đối chiếu **mới nhất của từng flow** (`analysis/overview.py`) thành một bức tranh mức hệ
+thống cho màn dashboard đầu tiên:
+
+| Trường | Nội dung |
+|---|---|
+| `health` | trạng thái chung (`healthy` / `warning` / `critical` / `unknown`) + số tiêu chí đạt |
+| `metrics[]` | từng tiêu chí chất lượng: `passed` = true/false/**null** (chưa đủ dữ liệu để kết luận) |
+| `issues[]` | lỗi đang bắt được, mỗi dòng trỏ về flow + tab chứa bằng chứng |
+| `services[]` | từng service: luồng đi qua, verdict, vấn đề quy về chính nó, số liệu DB |
+| `flows[]` | từng flow: verdict, trace, tóm tắt đối chiếu, service tham gia |
+
+Không phân tích lại — mọi con số đọc từ `analysis_results.evidence` đã lưu cùng verdict, nên khớp
+với báo cáo chi tiết. Service tham gia một flow lấy từ `mapping/<flow>.yaml` + `flow-map.yaml` nên
+flow **chưa từng phân tích** vẫn hiện đủ service của nó.
+
+Tham số `db=1` để gọi thêm dashboard db-quality (thêm tiêu chí "Chạy tốt về database?"); mặc định
+tắt vì service không chạy thì phải chờ hết timeout.
 
 ### `GET /api/db-quality` — số liệu database tại thời điểm gọi
 

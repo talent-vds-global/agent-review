@@ -8,9 +8,18 @@ trả về là trạng thái của cửa sổ thu thập tại thời điểm đ
 động — nó thống kê theo cửa sổ chứ không lưu lịch sử.
 """
 
+from concurrent.futures import ThreadPoolExecutor
+
 import requests
+from requests.adapters import HTTPAdapter
 
 import config
+
+# Không thử lại: urllib3 mặc định retry một lần, nên một dashboard không chạy tốn gấp đôi
+# timeout trước khi báo lỗi.
+_session = requests.Session()
+_session.mount("http://", HTTPAdapter(max_retries=0))
+_session.mount("https://", HTTPAdapter(max_retries=0))
 
 # Số phần tử tối đa trả về mỗi loại, tránh nhồi payload cho dashboard
 MAX_FINDINGS = 10
@@ -18,7 +27,7 @@ MAX_QUERIES = 10
 
 
 def _get_json(base_url: str, path: str, timeout: float = 5.0):
-    response = requests.get(f"{base_url.rstrip('/')}{path}", timeout=timeout)
+    response = _session.get(f"{base_url.rstrip('/')}{path}", timeout=timeout)
     response.raise_for_status()
     return response.json()
 
@@ -28,11 +37,13 @@ def _short_sql(sql: str, limit: int = 180) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
-def get_service_quality(service: str) -> dict:
+def get_service_quality(service: str, timeout: float = 5.0) -> dict:
     """Lấy số liệu DB của một service tại thời điểm gọi.
 
     Args:
         service (str): Tên service đúng như trong trace, vd "ewallet-payment-order".
+        timeout (float): Thời gian chờ mỗi lời gọi dashboard. Màn tổng quan gọi cả 4 service
+            một lượt nên dùng ngưỡng ngắn hơn để không treo trang khi service không chạy.
 
     Returns:
         dict: {service, url, available, error, score, metrics, findings, slow_queries, top_queries}
@@ -55,7 +66,7 @@ def get_service_quality(service: str) -> dict:
         return result
 
     try:
-        report = _get_json(base_url, "/report")
+        report = _get_json(base_url, "/report", timeout=timeout)
     except requests.exceptions.RequestException as e:
         result["error"] = f"Không gọi được dashboard db-quality ({base_url}): {e}"
         return result
@@ -108,7 +119,7 @@ def get_service_quality(service: str) -> dict:
     ]
 
     try:
-        queries = _get_json(base_url, "/collected-queries")
+        queries = _get_json(base_url, "/collected-queries", timeout=timeout)
     except (requests.exceptions.RequestException, ValueError):
         queries = []
 
@@ -127,7 +138,7 @@ def get_service_quality(service: str) -> dict:
     return result
 
 
-def get_quality_for_services(services: list) -> dict:
+def get_quality_for_services(services: list, timeout: float = 5.0) -> dict:
     """Lấy số liệu DB cho nhiều service (thường là các service xuất hiện trong trace đang xem).
 
     Args:
@@ -139,7 +150,11 @@ def get_quality_for_services(services: list) -> dict:
     wanted = [s for s in (services or []) if s in config.DB_QUALITY_URLS]
     if not wanted:
         wanted = list(config.DB_QUALITY_URLS.keys())
+    # Gọi song song: service nào không chạy thì phải chờ hết timeout, cộng dồn tuần tự là
+    # màn tổng quan đứng hình vài chục giây chỉ vì các dashboard DB chưa bật.
+    with ThreadPoolExecutor(max_workers=max(1, len(wanted))) as pool:
+        results = list(pool.map(lambda s: get_service_quality(s, timeout=timeout), wanted))
     return {
-        "services": [get_service_quality(s) for s in wanted],
+        "services": results,
         "configured": list(config.DB_QUALITY_URLS.keys()),
     }

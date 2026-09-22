@@ -1,4 +1,5 @@
 import os
+import sys
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
@@ -7,15 +8,24 @@ import config
 
 from analysis.evidence import build_evidence, to_prompt_text
 from analysis.flow_detect import detect_flow, latest_trace_for_flow, list_flows
+from analysis.overview import build_overview
 from context.results import save_result, get_latest_flow_result, list_analysis_results
 from sources.github import get_pr_diff
 from sources.runtime import (
     get_runtime_flow, get_latest_trace_id, get_spans, get_timeline, parse_log,
+    fetch_trace, build_timeline, trace_window_us,
 )
+from sources.logs import get_trace_logs
 from sources.confluence import get_flow_spec, render_spec_text, FLOW_PAGE_MAP
 from sources.dbquality import get_quality_for_services
 from agent.core import run_agent
 from agent.prompt import PROMPT_PRE_MERGE, PROMPT_POST_DEPLOY, FALLBACK_DESIGNS
+
+# Console Windows mặc định là cp1252/cp437: một dòng print tiếng Việt (vd "[Jaeger] Lỗi khi lấy
+# trace...") ném UnicodeEncodeError giữa request và biến lỗi 404 bình thường thành 500.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 app = Flask(__name__)
 CORS(app)  # Cho phép dashboard (cổng khác) gọi API
@@ -38,6 +48,8 @@ def index():
             "flow_evidence": "GET /api/flows/<flow_id>/evidence",
             "trace_flow": "GET /api/traces/<trace_id>/flow",
             "trace_timeline": "GET /api/traces/<trace_id>/timeline",
+            "trace_metrics": "GET /api/traces/<trace_id>/metrics",
+            "overview": "GET /api/overview",
             "db_quality": "GET /api/db-quality",
         }
     })
@@ -136,6 +148,62 @@ def trace_timeline(trace_id):
     if not timeline:
         return jsonify({"error": f"Không tìm thấy trace {trace_id} trong Jaeger."}), 404
     return jsonify(timeline)
+
+
+@app.route("/api/traces/<trace_id>/metrics", methods=["GET"])
+def trace_metrics(trace_id):
+    """Số liệu tổng hợp của một trace — **không kèm danh sách bước**.
+
+    Dashboard đã bỏ phần vẽ lại từng lời gọi; cái còn cần là những con số trả lời được
+    "luồng này chạy hết bao lâu, thu được bao nhiêu span, bao nhiêu dòng log, có lời gọi nào
+    lỗi không". Trả riêng khỏi `/timeline` để payload nhẹ và không kéo theo phần chi tiết.
+
+    Tham số `logs=0` để bỏ qua Loki khi chỉ cần số liệu trace.
+    """
+    trace = fetch_trace(trace_id)
+    if not trace:
+        return jsonify({"error": f"Không tìm thấy trace {trace_id} trong Jaeger."}), 404
+
+    timeline = build_timeline(trace, include_db=True)
+    steps = timeline.pop("steps", [])
+    db_rollup = timeline.get("db_rollup", [])
+
+    timeline["db"] = {
+        "calls": sum(g["calls"] for g in db_rollup),
+        "total_ms": round(sum(g["total_ms"] for g in db_rollup), 1),
+        "tables": len({(g["service"], g["table"]) for g in db_rollup}),
+        "top": db_rollup[:5],
+    }
+    timeline["slowest_steps"] = sorted(
+        ({"service": s["service"], "label": s["label"], "duration_ms": s["duration_ms"],
+          "error": s["error"], "status_code": s["status_code"]} for s in steps),
+        key=lambda s: -s["duration_ms"],
+    )[:5]
+    timeline["error_steps"] = [
+        {"service": s["service"], "label": s["label"], "status_code": s["status_code"],
+         "duration_ms": s["duration_ms"]}
+        for s in steps if s["error"]
+    ]
+
+    if request.args.get("logs", "1") not in ("0", "false", "no"):
+        start_us, end_us = trace_window_us(trace)
+        timeline["logs"] = get_trace_logs(trace_id, start_us, end_us)
+    return jsonify(timeline)
+
+
+@app.route("/api/overview", methods=["GET"])
+def overview():
+    """Tổng quan chất lượng toàn hệ thống, chia theo service — màn dashboard đầu tiên.
+
+    Gộp bảng đối chiếu mới nhất của mọi flow thành: các tiêu chí đạt/không đạt, danh sách lỗi
+    đang bắt được, và tình trạng từng service. Mọi con số đều lấy từ kết quả đã lưu, không
+    phân tích lại, nên khớp với báo cáo chi tiết của từng flow.
+
+    Tham số `db=1` để gọi thêm dashboard db-quality của các service (chậm hơn nếu service
+    không chạy, nên mặc định tắt).
+    """
+    include_db = request.args.get("db", "0") not in ("0", "false", "no")
+    return jsonify(build_overview(include_db=include_db))
 
 
 @app.route("/api/db-quality", methods=["GET"])
@@ -237,8 +305,16 @@ def runtime_check():
         runtime_flow = get_runtime_flow(trace_id)
         spans = get_spans(trace_id)
     else:
-        # Hỗ trợ fallback: nếu gửi text log trực tiếp thay vì trace
-        raw_log = str(payload["log"]) if "log" in payload else request.get_data(as_text=True)
+        # Hỗ trợ fallback: nếu gửi text log trực tiếp thay vì trace.
+        # KHÔNG lấy nguyên body làm log khi body là JSON: gọi {"flow_id": "F1"} mà Jaeger không
+        # có trace thì chính chuỗi JSON đó bị đem đi "phân tích log", sinh ra một bản ghi rác
+        # không trace không bằng chứng và che mất kết quả thật của flow.
+        if "log" in payload:
+            raw_log = str(payload["log"])
+        elif request.is_json:
+            raw_log = ""
+        else:
+            raw_log = request.get_data(as_text=True)
         if raw_log and raw_log.strip():
             print("\n[Post-deploy] Đang xử lý raw log...")
             runtime_flow = parse_log(raw_log)

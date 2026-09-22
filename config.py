@@ -23,6 +23,14 @@ MODEL = os.getenv("MODEL", "llama-3.3-70b-versatile")
 # Cấu hình Jaeger Tracing
 JAEGER_URL = os.getenv("JAEGER_URL", "http://localhost:16686")
 
+# Nguồn log runtime. Collector đẩy log OTLP sang Loki; log mang sẵn trace_id nên đếm được
+# "trace này sinh ra bao nhiêu dòng log, bao nhiêu dòng lỗi" mà không cần thêm hạ tầng.
+LOKI_URL = os.getenv("LOKI_URL", "http://localhost:13100")
+
+# Grafana chỉ dùng để dựng link "mở log của trace này" — không có thì phần link bị bỏ qua.
+GRAFANA_URL = os.getenv("GRAFANA_URL", "http://localhost:18088")
+LOKI_DATASOURCE_UID = os.getenv("LOKI_DATASOURCE_UID", "loki")
+
 # Cấu hình Confluence
 CONFLUENCE_BASE_URL = os.getenv("CONFLUENCE_BASE_URL", "")
 CONFLUENCE_EMAIL = os.getenv("CONFLUENCE_EMAIL", "")
