@@ -231,9 +231,14 @@ Hãy đối chiếu và kết luận."""
     print(f"\n[Post-deploy] Đang gửi cho agent đối chiếu flow {flow_id}...")
     conclusion = run_agent(system_prompt=PROMPT_POST_DEPLOY, user_input=user_input)
 
-    # Tách verdict từ dòng đầu tiên của kết luận
-    first_line = conclusion.strip().split("\n")[0].upper()
-    verdict = "WARN" if "WARN" in first_line else ("PASS" if "PASS" in first_line else "UNKNOWN")
+    # Tách verdict từ toàn bộ kết luận (WARN ưu tiên hơn PASS)
+    conclusion_upper = conclusion.upper()
+    if "WARN" in conclusion_upper:
+        verdict = "WARN"
+    elif "PASS" in conclusion_upper:
+        verdict = "PASS"
+    else:
+        verdict = "UNKNOWN"
 
     # Lưu kết quả vào DB
     result_id = save_result(
