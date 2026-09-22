@@ -216,7 +216,7 @@ def runtime_check():
         payload = {}
 
     flow_id = (payload.get("flow_id") or "").strip()
-    trace_id = payload.get("trace_id")
+    trace_id = str(payload.get("trace_id") or "").strip() or None
     service = payload.get("service")
     operation = payload.get("operation")
 
