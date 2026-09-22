@@ -1,4 +1,16 @@
-"""Module tích hợp Confluence API để lấy tài liệu thiết kế nghiệp vụ."""
+"""Module tích hợp Confluence API để lấy tài liệu thiết kế nghiệp vụ.
+
+Hai đầu ra từ cùng một trang:
+  * `get_flow_spec(flow_id)`       -> **spec có cấu trúc** (bước / rule / NFR) — dùng cho
+    đối chiếu tất định ở `analysis/evidence.py` và cho bảng "Đối chiếu tài liệu" trên dashboard.
+  * `get_design_by_flow(flow_id)`  -> bản text gọn của spec đó — dùng làm ngữ cảnh cho LLM.
+
+Bảng nguồn trong trang Confluence (mẫu `TPL-01-flow-spec`):
+  §Page Properties  Khoá | Giá trị
+  §2.3              Bước | Mô tả | Thực hiện bởi | Rule áp dụng
+  §3                Mã | Điều kiện | Hành động | Severity
+  §4                Mã | metric | operator | threshold | unit
+"""
 
 import html
 import re
@@ -8,9 +20,17 @@ from bs4 import BeautifulSoup
 import config
 import html2text
 
+# Ánh xạ flow -> page id của space "Ewallet-demo". Ghi đè được bằng biến môi trường
+# CONFLUENCE_FLOW_PAGES (dạng "F1=131083,F2=131100"), xem config.py — cần khi đổi space.
 FLOW_PAGE_MAP = {
-    "F1": "131083"
+    "F1": "131083",     # [F1] Nap tien vi qua doi tac
+    "F2": "131100",     # [F2] Thanh toan hoa don va nap telco
+    "F3": "98486",      # [F3] Chuyen tien P2P
+    "F4": "131117",     # [F4] Giao dich loi va hoan tien
+    "F5": "393229",     # [F5] Thong bao bat dong bo
+    "F6": "393246",     # [F6] Tra cuu lich su giao dich
 }
+FLOW_PAGE_MAP.update(config.CONFLUENCE_FLOW_PAGES)
 
 
 def get_page_content(page_id: str) -> str:
@@ -68,14 +88,231 @@ def get_flow_design(page_id: str) -> str:
     return text.strip()
 
 
+# ==========================================================================
+# Bóc tách spec có cấu trúc
+# ==========================================================================
+
+_RULE_CODE_RE = re.compile(r"\b(R|NFR)-[A-Z0-9]+-\d+\b")
+
+
+def _is_error(text: str) -> bool:
+    return not text or text.startswith("Lỗi") or text.startswith("Không tìm thấy")
+
+
+def _clean_cell(text: str) -> str:
+    if not text:
+        return ""
+    text = html.unescape(text)
+    text = " ".join(text.split())
+    return re.sub(r"\s+([,.;:])", r"\1", text)
+
+
+def _rows(table) -> list:
+    """Trả về danh sách hàng, mỗi hàng là list ô đã làm sạch."""
+    out = []
+    for tr in table.find_all("tr"):
+        cells = [_clean_cell(c.get_text(separator=" ", strip=True)) for c in tr.find_all(["th", "td"])]
+        if cells:
+            out.append(cells)
+    return out
+
+
+def _is_header(cells: list, *keywords: str) -> bool:
+    joined = " ".join(cells).lower()
+    return all(k in joined for k in keywords)
+
+
+def _find_heading(soup, *needles: str):
+    """Tìm heading đầu tiên chứa một trong các từ khoá (không phân biệt hoa thường)."""
+    for h in soup.find_all(["h1", "h2", "h3", "h4"]):
+        text = h.get_text().lower()
+        if any(n.lower() in text for n in needles):
+            return h
+    return None
+
+
+def _table_after(heading, soup, *header_keywords: str):
+    """Bảng ngay sau một heading; nếu không có heading thì dò theo tiêu đề cột."""
+    if heading is not None:
+        table = heading.find_next("table")
+        if table is not None:
+            return table
+    for table in soup.find_all("table"):
+        rows = _rows(table)
+        if rows and _is_header(rows[0], *header_keywords):
+            return table
+    return None
+
+
+def parse_flow_spec(html_content: str, flow_id: str = "", page_id: str = "") -> dict:
+    """Bóc trang Confluence thành spec có cấu trúc.
+
+    Returns:
+        dict: {flow_id, page_id, properties, steps, rules, nfrs, error}
+              steps: [{no, description, service, rules[]}]
+              rules: [{code, condition, action, severity}]
+              nfrs:  [{code, metric, operator, threshold, unit}]
+    """
+    spec = {
+        "flow_id": flow_id,
+        "page_id": page_id,
+        "source": f"confluence:{page_id}" if page_id else "confluence",
+        "properties": {},
+        "steps": [],
+        "rules": [],
+        "nfrs": [],
+        "error": "",
+    }
+    if _is_error(html_content):
+        spec["error"] = html_content or "Không lấy được nội dung trang Confluence."
+        return spec
+
+    soup = BeautifulSoup(html_content, "html.parser")
+
+    # --- Page Properties: Khoá | Giá trị ---
+    pp_table = _table_after(_find_heading(soup, "page properties"), soup, "flow")
+    if pp_table:
+        for cells in _rows(pp_table):
+            if len(cells) >= 2 and cells[0] and cells[0].lower() not in ("khoá", "khóa", "key"):
+                spec["properties"][cells[0].strip()] = cells[1].strip()
+
+    # --- §2.3 các bước: Bước | Mô tả | Thực hiện bởi | Rule áp dụng ---
+    step_table = _table_after(
+        _find_heading(soup, "2.3", "mô tả chi tiết nghiệp vụ"), soup, "bước", "mô tả"
+    )
+    if step_table:
+        for cells in _rows(step_table):
+            if _is_header(cells, "bước", "mô tả"):
+                continue
+            no = cells[0].rstrip(".").strip() if cells else ""
+            if not no or not no[0].isdigit():
+                continue
+            rule_cell = cells[3] if len(cells) > 3 else ""
+            spec["steps"].append({
+                "no": no,
+                "description": cells[1] if len(cells) > 1 else "",
+                "service": cells[2] if len(cells) > 2 else "",
+                "rules": [m.group(0) for m in _RULE_CODE_RE.finditer(rule_cell)],
+            })
+
+    # --- §3 business rule: Mã | Điều kiện | Hành động | Severity ---
+    rule_heading = _find_heading(soup, "3. business rule", "business rule")
+    rule_tables = []
+    if rule_heading is not None:
+        node = rule_heading
+        while True:
+            node = node.find_next()
+            if node is None:
+                break
+            if node.name == "h2" and node is not rule_heading:
+                break          # sang mục 4
+            if node.name == "table":
+                rule_tables.append(node)
+    if not rule_tables:
+        table = _table_after(None, soup, "mã", "hành động")
+        if table:
+            rule_tables.append(table)
+
+    for table in rule_tables:
+        for cells in _rows(table):
+            if _is_header(cells, "mã", "điều kiện"):
+                continue
+            code = cells[0] if cells else ""
+            if not code or not _RULE_CODE_RE.search(code):
+                continue
+            spec["rules"].append({
+                "code": _RULE_CODE_RE.search(code).group(0),
+                "condition": cells[1] if len(cells) > 1 else "",
+                "action": cells[2] if len(cells) > 2 else "",
+                "severity": cells[3] if len(cells) > 3 else "",
+            })
+
+    # --- §4 NFR: Mã | metric | operator | threshold | unit ---
+    nfr_table = _table_after(_find_heading(soup, "4. nfr", "nfr"), soup, "metric", "threshold")
+    if nfr_table:
+        for cells in _rows(nfr_table):
+            if _is_header(cells, "metric"):
+                continue
+            code = cells[0] if cells else ""
+            if not code or not _RULE_CODE_RE.search(code):
+                continue
+            spec["nfrs"].append({
+                "code": _RULE_CODE_RE.search(code).group(0),
+                "metric": cells[1] if len(cells) > 1 else "",
+                "operator": cells[2] if len(cells) > 2 else "",
+                "threshold": cells[3] if len(cells) > 3 else "",
+                "unit": cells[4] if len(cells) > 4 else "",
+            })
+
+    if not spec["steps"] and not spec["rules"] and not spec["nfrs"]:
+        spec["error"] = "Không nhận dạng được bảng bước / rule / NFR trong trang Confluence."
+    return spec
+
+
+def render_spec_text(spec: dict) -> str:
+    """Đổ spec có cấu trúc ra text gọn để nhét vào prompt của LLM."""
+    if spec.get("error") and not spec.get("steps"):
+        return spec["error"]
+
+    sections = []
+    props = spec.get("properties", {})
+    if props:
+        lines = ["## Flow"]
+        for key in ("Flow Name", "Entry Endpoint", "Services"):
+            if props.get(key):
+                lines.append(f"- {key}: {props[key]}")
+        if len(lines) > 1:
+            sections.append("\n".join(lines))
+
+    if spec.get("steps"):
+        lines = ["## Các bước"]
+        for step in spec["steps"]:
+            meta = [p for p in (step.get("service"), ", ".join(step.get("rules") or [])) if p]
+            suffix = f" ({'; '.join(meta)})" if meta else ""
+            lines.append(f"{step['no']}. {step['description']}{suffix}")
+        sections.append("\n".join(lines))
+
+    if spec.get("rules"):
+        lines = ["## Rules"]
+        for rule in spec["rules"]:
+            line = f"{rule['code']}: {rule['condition']} → {rule['action']}"
+            if rule.get("severity"):
+                line += f" [{rule['severity']}]"
+            lines.append(line)
+        sections.append("\n".join(lines))
+
+    if spec.get("nfrs"):
+        lines = ["## NFR"]
+        for nfr in spec["nfrs"]:
+            lines.append(" ".join(
+                f"{nfr['code']}: {nfr['metric']} {nfr['operator']} {nfr['threshold']} {nfr['unit']}".split()
+            ))
+        sections.append("\n".join(lines))
+
+    return "\n\n".join(sections).strip()
+
+
+def get_flow_spec(flow_id: str) -> dict:
+    """Lấy spec có cấu trúc của một flow từ Confluence.
+
+    Args:
+        flow_id (str): Mã flow, vd "F1".
+
+    Returns:
+        dict: spec như `parse_flow_spec`; `error` được điền nếu flow chưa có trang.
+    """
+    page_id = FLOW_PAGE_MAP.get(flow_id)
+    if not page_id:
+        return {
+            "flow_id": flow_id, "page_id": "", "source": "",
+            "properties": {}, "steps": [], "rules": [], "nfrs": [],
+            "error": f"Chưa có tài liệu Confluence cho flow {flow_id}.",
+        }
+    return parse_flow_spec(get_page_content(page_id), flow_id=flow_id, page_id=page_id)
+
+
 def get_flow_design_compact(page_id: str) -> str:
     """Lấy trang Confluence và trích xuất gọn các phần cần thiết cho agent đối chiếu.
-
-    Trích xuất:
-    1. Thông tin flow: Flow Name, Entry Endpoint, Services (từ Page Properties)
-    2. Các bước nghiệp vụ: từ bảng mục 2.3 (số. mô tả (service, rule))
-    3. Business rules: từ bảng mục 3 (Mã: điều kiện → hành động [severity])
-    4. NFR: từ bảng mục 4 (Mã: metric operator threshold unit)
 
     Args:
         page_id: ID trang Confluence (vd: "131083")
@@ -84,180 +321,12 @@ def get_flow_design_compact(page_id: str) -> str:
         str: Nội dung text có cấu trúc, gọn gàng hoặc thông báo lỗi nếu có.
     """
     html_content = get_page_content(page_id)
-    if not html_content or html_content.startswith("Lỗi") or html_content.startswith("Không tìm thấy"):
+    if _is_error(html_content):
         return html_content
-
-    def clean_cell(text: str) -> str:
-        if not text:
-            return ""
-        text = html.unescape(text)
-        text = " ".join(text.split())
-        return re.sub(r"\s+([,.;:])", r"\1", text)
-
-    soup = BeautifulSoup(html_content, "html.parser")
-    sections = []
-
-    # 1. Thông tin flow (từ Page Properties)
-    pp_heading = None
-    for h in soup.find_all(["h1", "h2", "h3", "h4"]):
-        if "page properties" in h.get_text().lower():
-            pp_heading = h
-            break
-
-    pp_table = pp_heading.find_next("table") if pp_heading else None
-    if not pp_table:
-        for tbl in soup.find_all("table"):
-            t_text = tbl.get_text()
-            if "Flow Name" in t_text or "Flow ID" in t_text:
-                pp_table = tbl
-                break
-
-    flow_info = {}
-    if pp_table:
-        for tr in pp_table.find_all("tr"):
-            cells = [clean_cell(c.get_text(separator=" ", strip=True)) for c in tr.find_all(["th", "td"])]
-            if len(cells) >= 2:
-                key = cells[0].strip().lower()
-                val = cells[1].strip()
-                if "flow name" in key:
-                    flow_info["Flow Name"] = val
-                elif "entry endpoint" in key:
-                    flow_info["Entry Endpoint"] = val
-                elif "services" in key:
-                    flow_info["Services"] = val
-
-    if flow_info:
-        flow_lines = ["## Flow"]
-        for k in ["Flow Name", "Entry Endpoint", "Services"]:
-            if k in flow_info:
-                flow_lines.append(f"- {k}: {flow_info[k]}")
-        sections.append("\n".join(flow_lines))
-
-    # 2. Các bước nghiệp vụ (mục 2.3)
-    step_heading = None
-    for h in soup.find_all(["h1", "h2", "h3", "h4"]):
-        t = h.get_text()
-        if "2.3" in t or "mô tả chi tiết nghiệp vụ" in t.lower():
-            step_heading = h
-            break
-
-    step_table = step_heading.find_next("table") if step_heading else None
-    if not step_table:
-        for tbl in soup.find_all("table"):
-            first_row = [clean_cell(c.get_text(separator=" ", strip=True)).lower() for c in tbl.find_all(["th", "td"])[:4]]
-            if any("bước" in c for c in first_row) and any("mô tả" in c for c in first_row):
-                step_table = tbl
-                break
-
-    if step_table:
-        step_lines = ["## Các bước"]
-        for tr in step_table.find_all("tr"):
-            cells = [clean_cell(c.get_text(separator=" ", strip=True)) for c in tr.find_all(["th", "td"])]
-            if not cells:
-                continue
-            if "bước" in cells[0].lower() and len(cells) > 1 and "mô tả" in cells[1].lower():
-                continue
-            step_no = cells[0] if len(cells) > 0 else ""
-            desc = cells[1] if len(cells) > 1 else ""
-            service = cells[2] if len(cells) > 2 else ""
-            rule = cells[3] if len(cells) > 3 else ""
-
-            meta_parts = [p for p in [service, rule] if p]
-            meta_str = f" ({', '.join(meta_parts)})" if meta_parts else ""
-
-            step_clean = step_no.rstrip(".")
-            line = f"{step_clean}. {desc}{meta_str}"
-            step_lines.append(line)
-        if len(step_lines) > 1:
-            sections.append("\n".join(step_lines))
-
-    # 3. Business rules (mục 3)
-    rule_heading = None
-    for h in soup.find_all(["h1", "h2", "h3"]):
-        t = h.get_text().lower()
-        if "3. business rule" in t or "business rule" in t or "quy tắc nghiệp vụ" in t:
-            rule_heading = h
-            break
-
-    rule_tables = []
-    if rule_heading:
-        curr = rule_heading
-        while curr:
-            curr = curr.find_next()
-            if not curr:
-                break
-            if curr.name == "h2" and curr != rule_heading:
-                break
-            if curr.name == "table":
-                rule_tables.append(curr)
-
-    if not rule_tables:
-        for tbl in soup.find_all("table"):
-            first_row = [clean_cell(c.get_text(separator=" ", strip=True)).lower() for c in tbl.find_all(["th", "td"])[:4]]
-            if any("mã" in c for c in first_row) and any("điều kiện" in c for c in first_row):
-                rule_tables.append(tbl)
-
-    rule_lines = ["## Rules"]
-    for tbl in rule_tables:
-        for tr in tbl.find_all("tr"):
-            cells = [clean_cell(c.get_text(separator=" ", strip=True)) for c in tr.find_all(["th", "td"])]
-            if not cells or ("mã" in cells[0].lower() and "điều kiện" in "".join(cells).lower()):
-                continue
-            code = cells[0] if len(cells) > 0 else ""
-            cond = cells[1] if len(cells) > 1 else ""
-            action = cells[2] if len(cells) > 2 else ""
-            severity = cells[3] if len(cells) > 3 else ""
-
-            if not code or not (cond or action):
-                continue
-
-            r_line = f"{code}: {cond} → {action}"
-            if severity:
-                r_line += f" [{severity}]"
-            rule_lines.append(r_line)
-
-    if len(rule_lines) > 1:
-        sections.append("\n".join(rule_lines))
-
-    # 4. NFR (mục 4)
-    nfr_heading = None
-    for h in soup.find_all(["h1", "h2", "h3"]):
-        t = h.get_text().lower()
-        if "4. nfr" in t or "nfr" in t or "phi chức năng" in t:
-            nfr_heading = h
-            break
-
-    nfr_table = nfr_heading.find_next("table") if nfr_heading else None
-    if not nfr_table:
-        for tbl in soup.find_all("table"):
-            first_row = [clean_cell(c.get_text(separator=" ", strip=True)).lower() for c in tbl.find_all(["th", "td"])[:5]]
-            if any("metric" in c for c in first_row) and any("operator" in c or "threshold" in c for c in first_row):
-                nfr_table = tbl
-                break
-
-    if nfr_table:
-        nfr_lines = ["## NFR"]
-        for tr in nfr_table.find_all("tr"):
-            cells = [clean_cell(c.get_text(separator=" ", strip=True)) for c in tr.find_all(["th", "td"])]
-            if not cells or ("mã" in cells[0].lower() and "metric" in "".join(cells).lower()):
-                continue
-            code = cells[0] if len(cells) > 0 else ""
-            metric = cells[1] if len(cells) > 1 else ""
-            op = cells[2] if len(cells) > 2 else ""
-            threshold = cells[3] if len(cells) > 3 else ""
-            unit = cells[4] if len(cells) > 4 else ""
-
-            if not code or not metric:
-                continue
-
-            nfr_line = " ".join(f"{code}: {metric} {op} {threshold} {unit}".split())
-            nfr_lines.append(nfr_line)
-
-        if len(nfr_lines) > 1:
-            sections.append("\n".join(nfr_lines))
-
-    result = "\n\n".join(sections).strip()
-    return result if result else get_flow_design(page_id)
+    spec = parse_flow_spec(html_content, page_id=page_id)
+    text = render_spec_text(spec)
+    # Không nhận dạng được bảng nào -> quay về bản markdown đầy đủ còn hơn không có gì
+    return text if text else get_flow_design(page_id)
 
 
 def get_design_by_flow(flow_id: str) -> str:

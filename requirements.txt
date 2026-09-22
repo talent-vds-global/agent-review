@@ -6,3 +6,5 @@ python-dotenv
 html2text
 flask-cors
 beautifulsoup4
+pyyaml
+openai

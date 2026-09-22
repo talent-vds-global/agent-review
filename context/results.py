@@ -10,7 +10,8 @@ def save_result(
     verdict: str,
     detail: str,
     runtime_flow: str = None,
-    trace_id: str = None
+    trace_id: str = None,
+    evidence: dict = None,
 ) -> int:
     """Ghi kết quả đánh giá của Agent vào bảng analysis_results trong database.
 
@@ -20,7 +21,9 @@ def save_result(
         verdict (str): Kết luận tổng quan ('PASS', 'WARN', hoặc 'UNKNOWN').
         detail (str): Nội dung phân tích và giải thích chi tiết của Agent.
         runtime_flow (str, optional): Chuỗi các bước runtime trích xuất từ trace.
-        trace_id (str, optional): Mã trace Jaeger liên quan đến kết quả.
+        trace_id (str, optional): Trace đã dùng để phân tích.
+        evidence (dict, optional): Bảng đối chiếu tài liệu ↔ runtime (analysis/evidence.py).
+            Lưu cùng verdict để báo cáo chi tiết luôn khớp với kết luận đã chốt.
 
     Returns:
         int: ID của bản ghi vừa được tạo trong bảng analysis_results.
@@ -30,10 +33,14 @@ def save_result(
         conn = get_db_connection()
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO analysis_results (flow_id, analysis_type, verdict, detail, runtime_flow, trace_id)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO analysis_results
+                    (flow_id, analysis_type, verdict, detail, runtime_flow, trace_id, evidence)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 RETURNING id;
-            """, (flow_id, analysis_type, verdict, detail, runtime_flow, trace_id))
+            """, (
+                flow_id, analysis_type, verdict, detail, runtime_flow, trace_id,
+                psycopg2.extras.Json(evidence) if evidence else None,
+            ))
             new_id = cur.fetchone()[0]
             conn.commit()
             print(f"[Database] Đã lưu kết quả phân tích #{new_id} cho flow '{flow_id}' ({verdict}).")
@@ -62,7 +69,8 @@ def get_latest_flow_result(flow_id: str) -> dict:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT id, flow_id, analysis_type, verdict, detail, runtime_flow, trace_id, created_at
+                SELECT id, flow_id, analysis_type, verdict, detail, runtime_flow,
+                       trace_id, evidence, created_at
                 FROM analysis_results
                 WHERE flow_id = %s
                 ORDER BY created_at DESC
@@ -70,6 +78,33 @@ def get_latest_flow_result(flow_id: str) -> dict:
             """, (flow_id,))
             row = cur.fetchone()
             return dict(row) if row else None
+    finally:
+        if conn:
+            conn.close()
+
+
+def get_latest_result_per_flow() -> list:
+    """Kết quả phân tích mới nhất của **từng** flow, trong một lần truy vấn.
+
+    Màn tổng quan cần bảng đối chiếu của mọi flow để cộng số liệu; gọi
+    `get_latest_flow_result` theo vòng lặp thì mỗi flow một kết nối. Không trả `detail`
+    (báo cáo của agent, rất dài) — phần đó chỉ đọc khi người dùng mở đúng một flow.
+
+    Returns:
+        list[dict]: mỗi flow một bản ghi {id, flow_id, analysis_type, verdict, trace_id,
+        evidence, created_at}, sắp theo flow_id.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT DISTINCT ON (flow_id)
+                       id, flow_id, analysis_type, verdict, trace_id, evidence, created_at
+                FROM analysis_results
+                ORDER BY flow_id, created_at DESC;
+            """)
+            return [dict(r) for r in cur.fetchall()]
     finally:
         if conn:
             conn.close()
