@@ -19,16 +19,31 @@ Quy tắc đánh giá:
 PROMPT_POST_DEPLOY = """Bạn là trợ lý giám sát chất lượng runtime. Nhiệm vụ: đối chiếu LUỒNG THỰC TẾ (từ trace)
 với THIẾT KẾ (spec), phát hiện sai lệch (drift).
 
+Đầu vào có sẵn phần "KẾT QUẢ ĐỐI CHIẾU TẤT ĐỊNH": hệ thống đã so từng bước trong tài liệu với
+dấu vết trong trace (span HTTP/gRPC/Kafka/WebSocket/SQL) và đã tính sẵn trạng thái MATCHED /
+PARTIAL / MISSING / NOT_OBSERVABLE / NOT_IN_BRANCH cùng số đo NFR.
+
+Cách dùng phần đó:
+- Coi nó là DỮ KIỆN đã kiểm chứng. Không tự kết luận ngược lại rằng một bước MATCHED là thiếu,
+  hay một bước MISSING là có.
+- NOT_IN_BRANCH nghĩa là nhánh nghiệp vụ thực tế không đi qua bước đó — KHÔNG phải lỗi.
+- NOT_OBSERVABLE nghĩa là bước đó không để lại dấu vết trong trace — nói rõ là "không kiểm được",
+  đừng khẳng định đúng hay sai.
+- Việc của bạn là GIẢI THÍCH: bước thiếu / NFR vi phạm gây hậu quả nghiệp vụ gì, nghi ngờ nguyên
+  nhân ở đâu, cần làm gì tiếp theo.
+
 Kiểm tra:
-1. Luồng thực tế có đi qua đủ các bước thiết kế không? Thiếu bước nào không?
+1. Luồng thực tế có đi qua đủ các bước thiết kế của nhánh này không? Thiếu bước nào?
 2. Có vi phạm NFR nào không (đặc biệt timeout, latency)?
 3. Có bước nào bị LỖI không, và nó ảnh hưởng gì tới nghiệp vụ?
 
 BẮT ĐẦU kết luận bằng đúng một từ trên dòng đầu tiên: PASS hoặc WARN.
-Sau đó xuống dòng và giải thích chi tiết. Tập trung nghiệp vụ và NFR.
+Sau đó xuống dòng và giải thích chi tiết. Khi nhắc tới một bước, ghi kèm số thứ tự bước trong
+tài liệu (vd "bước 18") để người đọc đối chiếu được với bảng bằng chứng. Tập trung nghiệp vụ và NFR.
 """
 
-# Thiết kế chuẩn của Flow F1 (tạm thời hardcode, sau sẽ thay bằng đọc từ Confluence)
+# Bản thiết kế F1 rút gọn, chỉ dùng khi KHÔNG lấy được trang Confluence
+# (mất mạng, sai token). Nguồn chuẩn là trang "[F1] Nạp tiền ví qua đối tác".
 DESIGN_F1 = """FLOW F1 - Nạp tiền ví qua đối tác (topup-partner)
 Entry: POST /api/wallet/topup
 
@@ -48,3 +63,8 @@ NFR bắt buộc:
 - NFR-TIMEOUT-01: lời gọi từ third-party sang partner-sim phải <= 3000ms
 - NFR-LAT-02: end-to-end tại gateway phải < 2000ms
 """
+
+# Thiết kế dự phòng theo flow, dùng khi Confluence không truy cập được
+FALLBACK_DESIGNS = {
+    "F1": DESIGN_F1,
+}
