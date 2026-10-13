@@ -1,3 +1,4 @@
+import hmac
 import os
 import sys
 
@@ -6,20 +7,23 @@ from flask_cors import CORS
 
 import config
 
-from analysis.evidence import build_evidence, to_prompt_text
+from analysis.evidence import build_evidence
 from analysis.flow_detect import detect_flow, latest_trace_for_flow, list_flows
 from analysis.overview import build_overview
-from context.results import save_result, get_latest_flow_result, list_analysis_results
+from analysis.post_deploy import run_post_deploy, split_verdict
+from context.results import get_latest_flow_result, list_analysis_results
 from sources.github import get_pr_diff
 from sources.runtime import (
-    get_runtime_flow, get_latest_trace_id, get_spans, get_timeline, parse_log,
+    get_latest_trace_id, get_spans, get_timeline,
     fetch_trace, build_timeline, trace_window_us,
 )
 from sources.logs import get_trace_logs
-from sources.confluence import get_flow_spec, render_spec_text, FLOW_PAGE_MAP
+from sources.confluence import get_flow_spec, FLOW_PAGE_MAP
 from sources.dbquality import get_quality_for_services
 from agent.core import run_agent
-from agent.prompt import PROMPT_PRE_MERGE, PROMPT_POST_DEPLOY, FALLBACK_DESIGNS
+from agent.prompt import PROMPT_PRE_MERGE
+from triggers import jobs, scheduler, store as trigger_store
+from triggers.confluence_watch import check_pages, flow_of_page
 
 # Console Windows mặc định là cp1252/cp437: một dòng print tiếng Việt (vd "[Jaeger] Lỗi khi lấy
 # trace...") ném UnicodeEncodeError giữa request và biến lỗi 404 bình thường thành 500.
@@ -29,8 +33,6 @@ for _stream in (sys.stdout, sys.stderr):
 
 app = Flask(__name__)
 CORS(app)  # Cho phép dashboard (cổng khác) gọi API
-
-DEFAULT_SERVICE = "ewallet-payment-order"
 
 
 @app.route("/", methods=["GET"])
@@ -51,14 +53,13 @@ def index():
             "trace_metrics": "GET /api/traces/<trace_id>/metrics",
             "overview": "GET /api/overview",
             "db_quality": "GET /api/db-quality",
+            "triggers_status": "GET /api/triggers",
+            "trigger_manual": "POST /api/triggers/run",
+            "trigger_run": "GET /api/triggers/runs/<run_id>",
+            "trigger_confluence_check": "POST /api/triggers/confluence/check",
+            "trigger_confluence_webhook": "POST /webhook/confluence",
         }
     })
-
-
-def _split_verdict(conclusion: str) -> str:
-    """Tách verdict từ dòng đầu tiên của kết luận agent."""
-    first_line = (conclusion or "").strip().split("\n")[0].upper()
-    return "WARN" if "WARN" in first_line else ("PASS" if "PASS" in first_line else "UNKNOWN")
 
 
 # ========== API cho Dashboard ==========
@@ -252,7 +253,7 @@ def github_webhook():
         f"Nội dung Code Diff:\n{pr_diff}"
     )
     conclusion = run_agent(system_prompt=PROMPT_PRE_MERGE, user_input=user_input)
-    verdict = _split_verdict(conclusion)
+    verdict = split_verdict(conclusion)
 
     print("\n========== KẾT LUẬN PRE-MERGE ==========")
     print(conclusion)
@@ -270,149 +271,156 @@ def github_webhook():
 
 @app.route("/runtime", methods=["POST"])
 def runtime_check():
-    """Luồng 2: Post-deploy (Runtime Trace / Log Monitoring).
+    """Luồng 2: Post-deploy — trigger **thủ công** cho một flow, chờ có kết quả mới trả về.
 
-    Thứ tự xử lý: chọn trace -> **nhận diện flow** (`analysis/flow_detect.py`) -> **đối chiếu tất
-    định** với tài liệu Confluence (`analysis/evidence.py`) -> đưa cả trace lẫn kết quả đối chiếu
-    cho agent diễn giải -> lưu verdict kèm bảng bằng chứng để dashboard đọc lại.
-
-    `flow_id` là tuỳ chọn: bỏ trống thì trace tự khai mình thuộc flow nào. Truyền `flow_id` mà
-    không truyền `trace_id` thì hệ thống tìm trace mới nhất **của đúng flow đó**.
+    Body (đều tuỳ chọn): `flow_id`, `trace_id`, `service`, `operation`, `log`. Logic phân tích
+    nằm ở `analysis/post_deploy.py`, dùng chung với lịch hằng ngày và trigger Confluence.
     """
     payload = request.get_json(silent=True) or {}
     if not isinstance(payload, dict):
         payload = {}
 
-    flow_id = (payload.get("flow_id") or "").strip()
-    trace_id = str(payload.get("trace_id") or "").strip() or None
-    service = payload.get("service")
-    operation = payload.get("operation")
-
-    runtime_flow = ""
-    spans = []
-    detection = None
-
-    # Chọn trace: ưu tiên trace đích danh -> trace mới nhất của flow -> trace mới nhất của service
-    if not trace_id and flow_id:
-        trace_id, _ = latest_trace_for_flow(flow_id)
-        if trace_id:
-            print(f"\n[Post-deploy] Trace mới nhất của flow {flow_id}: {trace_id}")
-    if not trace_id and (service or not flow_id):
-        trace_id = get_latest_trace_id(service=service or DEFAULT_SERVICE, operation=operation)
-
-    if trace_id:
-        print(f"\n[Post-deploy] Đang lấy runtime trace {trace_id} từ Jaeger...")
-        runtime_flow = get_runtime_flow(trace_id)
-        spans = get_spans(trace_id)
+    # Raw log chỉ lấy từ trường `log` hoặc body không-JSON. KHÔNG lấy nguyên body JSON làm log:
+    # gọi {"flow_id": "F1"} mà Jaeger không có trace thì chính chuỗi JSON đó bị đem đi "phân
+    # tích log", sinh ra một bản ghi rác không trace không bằng chứng, che mất kết quả thật.
+    if "log" in payload:
+        raw_log = str(payload["log"])
+    elif request.is_json:
+        raw_log = ""
     else:
-        # Hỗ trợ fallback: nếu gửi text log trực tiếp thay vì trace.
-        # KHÔNG lấy nguyên body làm log khi body là JSON: gọi {"flow_id": "F1"} mà Jaeger không
-        # có trace thì chính chuỗi JSON đó bị đem đi "phân tích log", sinh ra một bản ghi rác
-        # không trace không bằng chứng và che mất kết quả thật của flow.
-        if "log" in payload:
-            raw_log = str(payload["log"])
-        elif request.is_json:
-            raw_log = ""
-        else:
-            raw_log = request.get_data(as_text=True)
-        if raw_log and raw_log.strip():
-            print("\n[Post-deploy] Đang xử lý raw log...")
-            runtime_flow = parse_log(raw_log)
-        else:
-            where = (f"flow {flow_id}" if flow_id
-                     else f"service '{service or DEFAULT_SERVICE}'")
-            return jsonify({
-                "status": "error",
-                "message": f"Không tìm thấy trace nào của {where} trong Jaeger, "
-                           f"và cũng không có dữ liệu log trong body.",
-            }), 400
+        raw_log = request.get_data(as_text=True)
 
-    # Nhận diện flow TRƯỚC khi đọc tài liệu: đối chiếu trace với tài liệu của flow khác thì
-    # mọi bước đều "thiếu" và verdict vô nghĩa.
-    if spans:
-        detection = detect_flow(spans)
-        print(f"[Post-deploy] Nhận diện flow: {detection['kind']} {detection['flow_id']} "
-              f"— {detection['reason']}")
-        if not flow_id:
-            flow_id = detection["flow_id"]
-            if not flow_id:
-                return jsonify({
-                    "status": "error",
-                    "stage": "post_deploy",
-                    "trace_id": trace_id,
-                    "detection": detection,
-                    "message": "Không nhận diện được flow của trace này nên không có tài liệu để "
-                               "đối chiếu. Truyền flow_id, hoặc bổ sung cửa vào vào "
-                               "mapping/flow-map.yaml.",
-                }), 422
-        elif detection["flow_id"] and detection["flow_id"] != flow_id:
-            print(f"[Post-deploy] LƯU Ý: trace được nhận diện là {detection['flow_id']} "
-                  f"nhưng người gọi yêu cầu {flow_id}.")
-    if not flow_id:
-        flow_id = "F1"      # chỉ còn đường này khi phân tích raw log, không có span để nhận diện
-
-    # Tài liệu thiết kế từ Confluence — dạng có cấu trúc để đối chiếu, dạng text để đưa vào prompt
-    spec = get_flow_spec(flow_id)
-    design = render_spec_text(spec)
-    if spec.get("error") and not spec.get("steps"):
-        print(f"[Post-deploy] Không đọc được tài liệu Confluence: {spec['error']}")
-        design = FALLBACK_DESIGNS.get(flow_id, design)
-
-    # Đối chiếu tất định TRƯỚC khi gọi LLM
-    evidence = build_evidence(spec, spans, trace_id=trace_id or "") if spans else None
-    if evidence:
-        evidence["detection"] = detection
-        s = evidence["summary"]
-        print(f"[Post-deploy] Đối chiếu tài liệu: khớp {s['matched']}/{s['total_steps']} bước, "
-              f"thiếu {s['missing']}, NFR vi phạm {s['nfr_fail']} -> {s['verdict']}")
-
-    user_input = f"""THIẾT KẾ:
-{design}
-
-LUỒNG THỰC TẾ TỪ TRACE:
-{runtime_flow}
-
-{to_prompt_text(evidence) if evidence else ''}
-
-Hãy đối chiếu và kết luận."""
-
-    print(f"\n[Post-deploy] Đang gửi cho agent đối chiếu flow {flow_id}...")
-    conclusion = run_agent(system_prompt=PROMPT_POST_DEPLOY, user_input=user_input)
-    verdict = _split_verdict(conclusion)
-
-    # Luật verdict áp ở server: agent không được hạ mức khi phần tất định đã thấy vi phạm
-    if evidence and evidence["summary"]["verdict"] == "WARN" and verdict == "PASS":
-        print("[Post-deploy] Agent kết luận PASS nhưng đối chiếu tất định là WARN -> giữ WARN.")
-        verdict = "WARN"
-
-    result_id = save_result(
-        flow_id=flow_id,
-        analysis_type="post_deploy",
-        verdict=verdict,
-        detail=conclusion,
-        runtime_flow=runtime_flow,
-        trace_id=trace_id or None,
-        evidence=evidence,
+    body, code = run_post_deploy(
+        flow_id=payload.get("flow_id") or "",
+        trace_id=str(payload.get("trace_id") or "").strip() or None,
+        service=payload.get("service"),
+        operation=payload.get("operation"),
+        raw_log=raw_log,
+        triggered_by="manual",
     )
+    return jsonify(body), code
 
-    print("\n========== KẾT LUẬN POST-DEPLOY ==========")
-    print(f"Flow: {flow_id} | Verdict: {verdict} | Result ID: {result_id}")
-    print(conclusion)
-    print("==========================================\n")
 
+# ========== Trigger: thủ công (chạy nền), định kỳ, Confluence ==========
+
+def _requested_flows(payload: dict) -> list:
+    """`flow_ids` (list hoặc "F1,F2") hoặc `flow_id`; trống = mọi flow."""
+    raw = payload.get("flow_ids") or payload.get("flow_id") or []
+    if isinstance(raw, str):
+        raw = raw.split(",")
+    return [str(f).strip().upper() for f in raw if str(f).strip()]
+
+
+@app.route("/api/triggers", methods=["GET"])
+def triggers_status():
+    """Trạng thái các trigger: lịch hằng ngày (lần chạy tới), polling Confluence, hàng đợi,
+    phiên bản tài liệu đang theo dõi và các lượt chạy gần nhất."""
     return jsonify({
-        "status": "success",
-        "stage": "post_deploy",
-        "id": result_id,
-        "flow_id": flow_id,
-        "trace_id": trace_id,
-        "detection": detection,
-        "verdict": verdict,
-        "conclusion": conclusion,
-        "runtime_flow": runtime_flow,
-        "evidence": evidence,
-    }), 200
+        "scheduler": scheduler.status(),
+        "queue": jobs.status(),
+        "spec_versions": list(trigger_store.get_spec_versions().values()),
+        "runs": trigger_store.list_runs(limit=int(request.args.get("limit", 20))),
+    })
+
+
+@app.route("/api/triggers/run", methods=["POST"])
+def triggers_run():
+    """Trigger thủ công chạy nền cho một hoặc nhiều flow (trống = tất cả). Trả 202 + run_id.
+
+    Khác `POST /runtime`: không chờ LLM, phù hợp khi muốn "phân tích lại toàn bộ" từ dashboard.
+    """
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    flow_ids = _requested_flows(payload)
+    known = set(jobs.all_flow_ids())
+    unknown = [f for f in flow_ids if f not in known]
+    if unknown:
+        return jsonify({"error": "Flow không tồn tại trong mapping/flow-map.yaml: "
+                                 + ", ".join(unknown)}), 400
+    reason = (payload.get("reason") or "").strip() or "Kích hoạt thủ công"
+    run_id = jobs.enqueue(flow_ids, "manual", reason)
+    return jsonify({"status": "queued", "run_id": run_id,
+                    "flow_ids": flow_ids or jobs.all_flow_ids()}), 202
+
+
+@app.route("/api/triggers/runs/<int:run_id>", methods=["GET"])
+def trigger_run(run_id):
+    """Trạng thái và kết quả từng flow của một lượt chạy."""
+    row = trigger_store.get_run(run_id)
+    if row is None:
+        return jsonify({"error": f"Không có lượt chạy #{run_id}"}), 404
+    return jsonify(row)
+
+
+@app.route("/api/triggers/confluence/check", methods=["POST"])
+def trigger_confluence_check():
+    """Hỏi Confluence ngay bây giờ (không chờ chu kỳ polling); flow nào có trang đổi thì xếp lượt."""
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    result = check_pages(flow_ids=_requested_flows(payload) or None, triggered_by="confluence_poll")
+    return jsonify(result)
+
+
+def _page_id_from(payload: dict) -> str:
+    """Lấy page id từ các dạng payload hay gặp: Automation tự soạn body, webhook Confluence DC
+    (`page.id`), hoặc tham số query `?page_id=`."""
+    nested = [payload.get(k) for k in ("page", "content")]
+    for candidate in (
+        payload.get("page_id"), payload.get("pageId"), payload.get("id"),
+        *[n.get("id") for n in nested if isinstance(n, dict)],
+        request.args.get("page_id"),
+    ):
+        if candidate:
+            return str(candidate).strip()
+    return ""
+
+
+@app.route("/webhook/confluence", methods=["POST"])
+def confluence_webhook():
+    """Trigger khi trang Confluence thay đổi (Confluence Automation hoặc webhook Data Center).
+
+    Xác thực bằng token chung `CONFLUENCE_WEBHOOK_TOKEN` (header `X-VQ-Token` hoặc `?token=`).
+    Payload chỉ dùng để biết **trang nào**; việc trang có thật sự đổi hay không do
+    `check_pages()` hỏi lại Confluence, nên sự kiện gửi trùng không sinh thêm lượt phân tích.
+    """
+    if config.CONFLUENCE_WEBHOOK_TOKEN:
+        token = request.headers.get("X-VQ-Token") or request.args.get("token") or ""
+        if not hmac.compare_digest(token, config.CONFLUENCE_WEBHOOK_TOKEN):
+            return jsonify({"error": "Sai hoặc thiếu token"}), 401
+
+    payload = request.get_json(silent=True) or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    page_id = _page_id_from(payload)
+    if not page_id:
+        return jsonify({"error": "Không tìm thấy page id trong payload (page_id / page.id)."}), 400
+
+    flow_id = flow_of_page(page_id)
+    if not flow_id:
+        return jsonify({"status": "ignored",
+                        "message": f"Trang {page_id} không phải tài liệu của flow nào."}), 200
+
+    print(f"\n[Confluence webhook] Trang {page_id} ({flow_id}) báo thay đổi.")
+    result = check_pages(flow_ids=[flow_id], triggered_by="confluence_webhook",
+                         run_on_first_seen=True)
+    if result["errors"]:
+        return jsonify({"status": "error", "flow_id": flow_id, **result}), 502
+    if result["run_id"]:
+        return jsonify({"status": "queued", "flow_id": flow_id, **result}), 202
+    return jsonify({"status": "unchanged", "flow_id": flow_id, **result}), 200
+
+
+def _start_background() -> None:
+    # Debug bật reloader: tiến trình cha chỉ canh file, tiến trình con mới chạy app. Chỉ bật
+    # lịch ở tiến trình con, nếu không mọi trigger định kỳ bị bắn hai lần.
+    if config.FLASK_DEBUG and os.environ.get("WERKZEUG_RUN_MAIN") != "true":
+        return
+    trigger_store.ensure_schema()
+    scheduler.start()
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    _start_background()
+    app.run(host="0.0.0.0", port=8000, debug=config.FLASK_DEBUG)

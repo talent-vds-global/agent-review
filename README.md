@@ -6,7 +6,7 @@ và một Agent Core (Google Gemini).
 
 | | Luồng 1 — Pre-merge | Luồng 2 — Post-deploy |
 |---|---|---|
-| Kích hoạt | GitHub webhook khi có Pull Request | Gọi thủ công / định kỳ sau khi deploy |
+| Kích hoạt | GitHub webhook khi có Pull Request | Thủ công · lịch mỗi ngày một lần · khi trang Confluence đổi (§10) |
 | Endpoint | `POST /webhook` | `POST /runtime` |
 | Đầu vào | Code diff của PR (GitHub API) | Trace từ Jaeger, hoặc raw log |
 | Đối chiếu với | Business rule trong Project Context | Trang flow trên Confluence (F1–F6, tự nhận diện flow từ trace): bước §2.3, rule §3, NFR §4 |
@@ -90,7 +90,7 @@ còn lại → `UNKNOWN`. Vì vậy prompt bắt buộc model mở đầu bằng
 
 ```text
 agent-review/
-├── app.py                    # Flask app: 2 webhook + 2 API cho dashboard
+├── app.py                    # Flask app: webhook GitHub/Confluence, /runtime, API dashboard + trigger
 ├── config.py                 # Đọc .env → hằng số cấu hình
 ├── requirements.txt
 ├── Dockerfile
@@ -104,6 +104,7 @@ agent-review/
 ├── analysis/                 # Đối chiếu tất định (chạy TRƯỚC khi gọi LLM)
 │   ├── flow_detect.py        # detect_flow(): trace này thuộc luồng nghiệp vụ nào
 │   ├── evidence.py           # build_evidence(): bước tài liệu ↔ span runtime, NFR, rule
+│   ├── post_deploy.py        # run_post_deploy(): một vòng Luồng 2, dùng chung cho mọi trigger
 │   └── check_mapping.py      # CLI kiểm mapping trên một trace, không cần Flask
 │
 ├── mapping/
@@ -122,12 +123,19 @@ agent-review/
 │   ├── dbquality.py          # Số liệu database-quality-library, đọc tại thời điểm gọi
 │   └── bitbuckit.py          # (chưa triển khai)
 │
+├── triggers/                 # Kích hoạt tự động Luồng 2 (§10)
+│   ├── scheduler.py          # luồng nền: lịch hằng ngày + polling Confluence
+│   ├── confluence_watch.py   # phát hiện trang F1–F6 đổi version (polling & webhook)
+│   ├── jobs.py               # hàng đợi chạy tuần tự
+│   └── store.py              # bảng trigger_runs, spec_versions; ensure_schema()
+│
 ├── db/
 │   ├── seed.sql              # entities + relationships + dữ liệu mẫu
-│   └── analysis_table.sql    # bảng analysis_results
+│   └── analysis_table.sql    # analysis_results + trigger_runs + spec_versions (tự chạy khi khởi động)
 │
 └── test_*.py                 # Script thử tay từng phần (không phải pytest)
-    └── test_flow_detect.py   # Chạy nhận diện flow trên file trace thật của ewallet-demo
+    ├── test_flow_detect.py   # Chạy nhận diện flow trên file trace thật của ewallet-demo
+    └── test_triggers.py      # Kiểm logic trigger, không cần DB/Jaeger/LLM
 ```
 
 ---
@@ -271,7 +279,9 @@ Phải thấy đủ 3 bảng: `entities`, `relationships`, `analysis_results`.
 python app.py
 ```
 
-Server lắng nghe tại `http://0.0.0.0:8000`. Kiểm tra sống:
+Server lắng nghe tại `http://0.0.0.0:8000`, đồng thời bật **bộ lập lịch nền** (lịch hằng ngày +
+polling Confluence, §10). Lần chạy đầu tự tạo các bảng/cột mới trong `db/analysis_table.sql`.
+Debug của Flask **mặc định tắt**; cần auto-reload khi sửa code thì đặt `FLASK_DEBUG=1`. Kiểm tra sống:
 
 ```bash
 curl http://localhost:8000/
@@ -775,7 +785,119 @@ là lý do `latest_trace_for_flow()` tồn tại: lọc theo service thôi thì 
 
 ---
 
-## 10. Nối GitHub webhook
+## 10. Trigger tự động (Luồng 2)
+
+Có ba cách kích hoạt một lượt phân tích. Dù kích hoạt bằng cách nào, lượt đó cũng chạy cùng một hàm
+`analysis/post_deploy.py:run_post_deploy()` và ghi nguồn kích hoạt vào cột `analysis_results.triggered_by`.
+
+| Trigger | Khi nào | `triggered_by` | Phạm vi |
+|---|---|---|---|
+| Thủ công | Nút **Lấy trace mới & phân tích** (`POST /runtime`, chờ kết quả) hoặc **Phân tích lại tất cả** (`POST /api/triggers/run`, chạy nền) | `manual` | 1 flow / chọn / tất cả |
+| Định kỳ | Mỗi ngày lúc `SCHEDULE_DAILY_AT` (mặc định 02:00, giờ `Asia/Ho_Chi_Minh`) | `schedule_daily` | Mọi flow trong `flow-map.yaml` |
+| Tài liệu đổi | Trang F1–F6 trên Confluence tăng `version.number` | `confluence_poll` / `confluence_webhook` | Chỉ flow có trang vừa đổi |
+
+```mermaid
+graph LR
+    BTN[Dashboard / curl] -->|POST /api/triggers/run| Q
+    SCH["triggers/scheduler.py<br/>luồng nền, 15s/nhịp"] -->|tới giờ hằng ngày| Q
+    SCH -->|mỗi CONFLUENCE_POLL_SECONDS| W
+    CA[Confluence Automation] -->|POST /webhook/confluence| W
+    W["triggers/confluence_watch.py<br/>so version với bảng spec_versions"] -->|trang đổi| Q
+    Q["triggers/jobs.py<br/>hàng đợi, chạy tuần tự"] --> RUN["run_post_deploy(flow)"]
+    RUN --> DB[("analysis_results<br/>trigger_runs")]
+```
+
+### 10.1 Các quyết định thiết kế
+
+- **Một hàng đợi, chạy tuần tự.** Mỗi flow là một lần gọi LLM. Chạy tuần tự để không chạm rate limit,
+  và khi hai trigger bắn cùng lúc thì lượt sau chỉ xếp hàng sau lượt trước. Lượt giống hệt đang chờ
+  thì được gộp, nên bấm hai lần chỉ chạy một lần.
+- **Webhook chỉ là lời nhắc.** `POST /webhook/confluence` không tin payload: nó hỏi lại Confluence
+  phiên bản thật rồi so với `spec_versions`. Sự kiện gửi trùng, hoặc polling và webhook cùng thấy một
+  lần sửa, đều chỉ sinh **một** lượt phân tích.
+- **Polling lần đầu chỉ ghi mốc.** Nếu không thì mỗi lần khởi động server sẽ phân tích lại cả 6 flow.
+  Webhook thì khác: khi trang chưa từng được ghi mốc, webhook vẫn chạy vì chính Confluence vừa báo trang đổi.
+- **Lịch hằng ngày tính theo DB, không theo bộ nhớ.** Khởi động lại server không làm lịch chạy lại.
+  Nếu server tắt đúng giờ chạy thì lần khởi động sau trong ngày sẽ **chạy bù** (`SCHEDULE_CATCH_UP=true`).
+  Hệ quả là lần đầu bật server sau 02:00 sẽ chạy ngay một lượt.
+- **Flow không có trace thì `skipped`, không phải lỗi.** Lúc Jaeger trống, lượt chạy kết thúc ở
+  trạng thái `skipped`.
+- **Báo cáo ghi phiên bản tài liệu đã dùng** (`spec_version`). Nhờ đó khi demo "sửa tài liệu → verdict
+  đổi" có thể chỉ ra verdict nào tính trên phiên bản trang nào.
+
+### 10.2 Cấu hình (`.env`)
+
+| Biến | Mặc định | Ý nghĩa |
+|---|---|---|
+| `SCHEDULER_ENABLED` | `true` | Tắt toàn bộ lịch nền; thủ công và webhook vẫn chạy |
+| `SCHEDULE_DAILY_AT` | `02:00` | Giờ chạy hằng ngày (HH:MM). Để trống = tắt |
+| `SCHEDULE_TZ` | `Asia/Ho_Chi_Minh` | Múi giờ của lịch (Windows cần gói `tzdata`, đã có trong `requirements.txt`) |
+| `SCHEDULE_CATCH_UP` | `true` | Server tắt đúng giờ thì chạy bù trong ngày |
+| `CONFLUENCE_POLL_SECONDS` | `60` | Chu kỳ hỏi phiên bản trang. `0` = tắt polling |
+| `CONFLUENCE_WEBHOOK_TOKEN` | *(trống)* | Token cho `POST /webhook/confluence`. Trống = nhận mọi request (chỉ để thử trên máy) |
+| `FLASK_DEBUG` | `false` | Bật debug/reloader. **Không** bật khi đã mở tunnel ra ngoài |
+
+Polling dùng lại `CONFLUENCE_BASE_URL` / `CONFLUENCE_EMAIL` / `CONFLUENCE_TOKEN` sẵn có, không cần
+mở cổng ra Internet. Webhook chỉ cần khi muốn phản ứng **ngay** khi publish trang.
+
+### 10.3 Nối Confluence Automation (tuỳ chọn, cho phản ứng tức thì)
+
+1. Mở tunnel: `ngrok http 8000` (hoặc `cloudflared tunnel --url http://localhost:8000`).
+2. Trong space *Ewallet-demo*: **Space settings → Automation → Create rule**
+   - Trigger: **Page edited** (thêm **Page published** nếu muốn).
+   - Action: **Send web request**
+     - Web request URL: `https://<domain-tunnel>/webhook/confluence`
+     - HTTP method: `POST`, Web request body: *Custom data*: `{"page_id": "{{page.id}}"}`
+     - Headers: `X-VQ-Token` = giá trị `CONFLUENCE_WEBHOOK_TOKEN`
+3. Bấm **Validate** của action: nếu trang không thuộc F1–F6, server trả `200 ignored`.
+
+Endpoint cũng nhận dạng payload webhook `page_updated` của **Confluence Data Center** (`page.id`), và nhận
+`?page_id=` / `?token=` trên URL cho các công cụ không đặt được header.
+
+### 10.4 API
+
+| Endpoint | Việc |
+|---|---|
+| `GET /api/triggers` | Lịch (lần chạy tới), polling (lần kiểm cuối), hàng đợi, phiên bản tài liệu, 20 lượt chạy gần nhất |
+| `POST /api/triggers/run` | Body `{}` (mọi flow), `{"flow_id":"F1"}` hoặc `{"flow_ids":["F1","F3"]}` → `202 {run_id}` |
+| `GET /api/triggers/runs/<id>` | Trạng thái `queued/running/done/skipped/failed` + kết quả từng flow |
+| `POST /api/triggers/confluence/check` | Hỏi Confluence ngay, không chờ chu kỳ polling |
+| `POST /webhook/confluence` | Webhook từ Confluence (§10.3). `202 queued` / `200 unchanged` / `200 ignored` / `401` |
+
+Dashboard (màn **Tổng quan hệ thống**, panel *Kích hoạt phân tích*) gọi đúng các endpoint này. Panel
+tự hỏi trạng thái 3 giây/lần khi có lượt đang chạy, 20 giây/lần khi rảnh. Báo cáo của từng luồng hiện
+badge *Kích hoạt: …* và *Tài liệu: vN*.
+
+### 10.5 Kịch bản demo
+
+```bash
+# 1. Bật lịch ngắn để thấy ngay (vd 2 phút nữa) + polling 15s
+SCHEDULE_DAILY_AT=14:32 CONFLUENCE_POLL_SECONDS=15 python app.py
+
+# 2. Thủ công: phân tích lại toàn bộ, rồi xem tiến độ
+curl -X POST http://localhost:8000/api/triggers/run -H "Content-Type: application/json" -d "{}"
+curl http://localhost:8000/api/triggers
+
+# 3. Tài liệu đổi: sửa trang F1 trên Confluence (vd NFR-LAT-01 500 → 1000 ms) rồi Publish.
+#    Trong ≤15s, polling thấy v1 → v2 và tự phân tích lại F1; dashboard hiện lượt mới
+#    "Confluence (polling) — Trang F1 đổi v1 → v2".
+
+# 4. Giả lập webhook không cần tunnel/Automation
+curl -X POST "http://localhost:8000/webhook/confluence" -H "X-VQ-Token: <token>" -H "Content-Type: application/json" -d "{\"page_id\":\"131083\"}"
+```
+
+Muốn diễn lại bước 3 mà không sửa trang thật: hạ phiên bản đã ghi rồi gọi webhook/check.
+
+```bash
+docker exec pg-context psql -U postgres -d context -c "UPDATE spec_versions SET version = 0 WHERE flow_id = 'F1';"
+curl -X POST http://localhost:8000/api/triggers/confluence/check
+```
+
+Kiểm logic trigger không cần DB/Jaeger/Confluence/LLM: `python test_triggers.py`.
+
+---
+
+## 11. Nối GitHub webhook
 
 Mở tunnel ra ngoài bằng ngrok:
 
@@ -797,7 +919,7 @@ Trong repo GitHub: **Settings → Webhooks → Add webhook**
 
 ---
 
-## 11. Kiểm thử nhanh
+## 12. Kiểm thử nhanh
 
 ### Luồng 1 — giả lập webhook
 
@@ -884,6 +1006,7 @@ Các file `test_*.py` ở thư mục gốc là **script chạy tay**, không ph�
 | `test_runtime_check.py` | Chạy trọn Luồng 2 không qua Flask (trace → agent → lưu DB) |
 | `test_confluence.py` | Lấy một trang Confluence, lưu ra `f1_content.html` |
 | `test_flow_detect.py` | Chạy nhận diện flow trên file trace thật của `ewallet-demo` — **không cần Jaeger** (§9.4) |
+| `test_triggers.py` | Kiểm lịch hằng ngày, polling/webhook Confluence, gộp lượt trùng — **không cần DB/Jaeger/LLM** (§10) |
 
 `test_trace.py` và `test_runtime_check.py` đang **hardcode `TRACE_ID`** — sửa lại theo trace thật của
 bạn trước khi chạy. `test_flow_detect.py` thì tự tìm `traces*.jsonl` trong repo `ewallet-demo` nằm
@@ -891,7 +1014,7 @@ cạnh repo này; chỉ đường dẫn khác bằng `--traces`.
 
 ---
 
-## 12. Hiện trạng & giới hạn
+## 13. Hiện trạng & giới hạn
 
 | Hạng mục | Trạng thái |
 |---|---|
@@ -909,14 +1032,16 @@ cạnh repo này; chỉ đường dẫn khác bằng `--traces`.
 | Tool của agent | ⚠️ mới có `query_rules`; `query_impact` và `query_baseline` còn là stub |
 | Bitbucket | ❌ `sources/bitbuckit.py` rỗng |
 | Xác thực webhook | ❌ chưa kiểm tra `X-Hub-Signature-256` |
-| `debug=True` | ⚠️ đang bật trong `app.py`, tắt trước khi lên môi trường thật |
+| Trigger | ✅ thủ công, lịch hằng ngày, Confluence (polling + webhook) — §10 |
+| Hàng đợi trigger | ⚠️ nằm trong bộ nhớ của một tiến trình: chạy nhiều worker/replica thì mỗi bản đều tự lập lịch. Lượt dở khi tắt server được đánh dấu `failed` lúc khởi động lại |
+| `debug` | ✅ mặc định tắt, bật bằng `FLASK_DEBUG=1` |
 
 Một khác biệt cấu hình cần biết: `config.py` mặc định `MODEL=gemini-3.6-flash`, còn `.env.example`
 ghi `gemini-2.5-flash`. Giá trị trong `.env` thắng — nên đặt rõ để tránh nhầm.
 
 ---
 
-## 13. Xử lý sự cố
+## 14. Xử lý sự cố
 
 | Triệu chứng | Nguyên nhân thường gặp |
 |---|---|
@@ -940,7 +1065,7 @@ ghi `gemini-2.5-flash`. Giá trị trong `.env` thắng — nên đặt rõ đ�
 
 ---
 
-## 14. Repo liên quan
+## 15. Repo liên quan
 
 | Repo | Vai trò |
 |---|---|

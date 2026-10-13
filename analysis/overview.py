@@ -102,8 +102,10 @@ def _nfr_service(nfr: dict) -> str:
 def _issue(flow_id: str, kind: str, severity: str, title: str, detail: str,
            service: str = "", tab: str = "evidence", ref: str = "") -> dict:
     """Một dòng trong danh sách "lỗi đang bắt được" của dashboard."""
+    # Có service trong id: cùng một nhãn lời gọi (vd POST /api/wallet/transfer) lỗi ở cả gateway
+    # lẫn service phía sau là hai dòng riêng, trùng id thì React gộp/bỏ sót dòng.
     return {
-        "id": f"{flow_id}:{kind}:{ref or title}",
+        "id": f"{flow_id}:{kind}:{service + '/' if service else ''}{ref or title}",
         "flow_id": flow_id,
         "kind": kind,
         "severity": severity,

@@ -67,6 +67,39 @@ def get_page_content(page_id: str) -> str:
         return f"Lỗi không xác định khi xử lý nội dung Confluence: {str(e)}"
 
 
+def get_page_version(page_id: str) -> dict:
+    """Phiên bản hiện tại của một trang — **không** tải nội dung, dùng để biết trang đã đổi chưa.
+
+    Confluence tăng `version.number` mỗi lần trang được publish, nên so số này là đủ để phát hiện
+    tài liệu thay đổi, rẻ hơn nhiều so với tải và so cả trang.
+
+    Returns:
+        dict: {page_id, version, title, updated_at, message} — hoặc {page_id, error} khi lỗi.
+    """
+    if not config.CONFLUENCE_BASE_URL or not config.CONFLUENCE_EMAIL or not config.CONFLUENCE_TOKEN:
+        return {"page_id": page_id, "error": "Chưa cấu hình CONFLUENCE_BASE_URL/EMAIL/TOKEN."}
+
+    url = f"{config.CONFLUENCE_BASE_URL.rstrip('/')}/wiki/api/v2/pages/{page_id}"
+    auth = HTTPBasicAuth(config.CONFLUENCE_EMAIL, config.CONFLUENCE_TOKEN)
+    try:
+        response = requests.get(url, auth=auth, headers={"Accept": "application/json"}, timeout=15)
+        if response.status_code == 404:
+            return {"page_id": page_id, "error": f"Không tìm thấy trang {page_id}."}
+        response.raise_for_status()
+        data = response.json()
+    except (requests.exceptions.RequestException, ValueError) as e:
+        return {"page_id": page_id, "error": f"Lỗi khi gọi Confluence API ({url}): {e}"}
+
+    version = data.get("version") or {}
+    return {
+        "page_id": page_id,
+        "version": version.get("number"),
+        "title": data.get("title", ""),
+        "updated_at": version.get("createdAt", ""),
+        "message": version.get("message", ""),
+    }
+
+
 def get_flow_design(page_id: str) -> str:
     """Lấy trang Confluence và chuyển thành text sạch để làm design cho agent.
 

@@ -63,3 +63,35 @@ DB_QUALITY_URLS = _parse_pairs(os.getenv("DB_QUALITY_URLS", "")) or {
 
 # Thư mục chứa file ánh xạ bước tài liệu -> span runtime (mapping/<flow>.yaml)
 MAPPING_DIR = os.getenv("MAPPING_DIR", os.path.join(os.path.dirname(__file__), "mapping"))
+
+
+def _flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Bật debug của Flask. Mặc định TẮT: endpoint webhook Confluence được mở ra Internet qua tunnel,
+# và trình debug của Werkzeug không được phép lộ ra ngoài.
+FLASK_DEBUG = _flag("FLASK_DEBUG", False)
+
+# ---------- Trigger (triggers/) ----------
+# Bật/tắt toàn bộ bộ lập lịch nền (lịch hằng ngày + polling Confluence). Trigger thủ công và
+# webhook Confluence vẫn chạy được khi tắt.
+SCHEDULER_ENABLED = _flag("SCHEDULER_ENABLED", True)
+
+# Lịch chạy định kỳ: mỗi ngày một lần vào giờ này (HH:MM) theo múi giờ SCHEDULE_TZ, phân tích lại
+# mọi flow. Để trống thì tắt lịch hằng ngày.
+SCHEDULE_DAILY_AT = os.getenv("SCHEDULE_DAILY_AT", "02:00").strip()
+SCHEDULE_TZ = os.getenv("SCHEDULE_TZ", "Asia/Ho_Chi_Minh").strip()
+# Server tắt đúng giờ chạy (máy dev ngủ, redeploy) thì lần khởi động sau trong ngày chạy bù.
+SCHEDULE_CATCH_UP = _flag("SCHEDULE_CATCH_UP", True)
+
+# Polling Confluence: cứ bao nhiêu giây hỏi phiên bản của các trang F1-F6 một lần. 0 = tắt.
+# Không cần tunnel; là đường dự phòng khi webhook/Automation không tới được.
+CONFLUENCE_POLL_SECONDS = int(os.getenv("CONFLUENCE_POLL_SECONDS", "60") or 0)
+
+# Token chung với Confluence Automation ("Send web request") — gửi qua header X-VQ-Token hoặc
+# tham số ?token=. Để trống thì endpoint nhận mọi request (chỉ dùng khi chạy thử trên máy).
+CONFLUENCE_WEBHOOK_TOKEN = os.getenv("CONFLUENCE_WEBHOOK_TOKEN", "").strip()

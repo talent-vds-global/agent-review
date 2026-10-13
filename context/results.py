@@ -12,6 +12,9 @@ def save_result(
     runtime_flow: str = None,
     trace_id: str = None,
     evidence: dict = None,
+    triggered_by: str = None,
+    trigger_run_id: int = None,
+    spec_version: int = None,
 ) -> int:
     """Ghi kết quả đánh giá của Agent vào bảng analysis_results trong database.
 
@@ -24,6 +27,10 @@ def save_result(
         trace_id (str, optional): Trace đã dùng để phân tích.
         evidence (dict, optional): Bảng đối chiếu tài liệu ↔ runtime (analysis/evidence.py).
             Lưu cùng verdict để báo cáo chi tiết luôn khớp với kết luận đã chốt.
+        triggered_by (str, optional): nguồn kích hoạt (manual / schedule_daily /
+            confluence_poll / confluence_webhook).
+        trigger_run_id (int, optional): lượt chạy trong bảng trigger_runs.
+        spec_version (int, optional): phiên bản trang Confluence đã dùng để đối chiếu.
 
     Returns:
         int: ID của bản ghi vừa được tạo trong bảng analysis_results.
@@ -34,12 +41,14 @@ def save_result(
         with conn.cursor() as cur:
             cur.execute("""
                 INSERT INTO analysis_results
-                    (flow_id, analysis_type, verdict, detail, runtime_flow, trace_id, evidence)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                    (flow_id, analysis_type, verdict, detail, runtime_flow, trace_id, evidence,
+                     triggered_by, trigger_run_id, spec_version)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 RETURNING id;
             """, (
                 flow_id, analysis_type, verdict, detail, runtime_flow, trace_id,
                 psycopg2.extras.Json(evidence) if evidence else None,
+                triggered_by, trigger_run_id, spec_version,
             ))
             new_id = cur.fetchone()[0]
             conn.commit()
@@ -70,7 +79,7 @@ def get_latest_flow_result(flow_id: str) -> dict:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
                 SELECT id, flow_id, analysis_type, verdict, detail, runtime_flow,
-                       trace_id, evidence, created_at
+                       trace_id, evidence, triggered_by, trigger_run_id, spec_version, created_at
                 FROM analysis_results
                 WHERE flow_id = %s
                 ORDER BY created_at DESC
@@ -100,7 +109,8 @@ def get_latest_result_per_flow() -> list:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
                 SELECT DISTINCT ON (flow_id)
-                       id, flow_id, analysis_type, verdict, trace_id, evidence, created_at
+                       id, flow_id, analysis_type, verdict, trace_id, evidence,
+                       triggered_by, spec_version, created_at
                 FROM analysis_results
                 ORDER BY flow_id, created_at DESC;
             """)
@@ -124,7 +134,8 @@ def list_analysis_results(limit: int = 50) -> list:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT id, flow_id, analysis_type, verdict, trace_id, created_at
+                SELECT id, flow_id, analysis_type, verdict, trace_id, triggered_by,
+                       trigger_run_id, spec_version, created_at
                 FROM analysis_results
                 ORDER BY created_at DESC
                 LIMIT %s;
