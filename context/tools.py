@@ -1,4 +1,4 @@
-from context.db import get_db_connection
+from context.db import get_db_connection, release_db_connection
 
 def query_rules(function_name: str) -> str:
     """Truy vấn các quy tắc nghiệp vụ liên quan đến một hàm trong Project Context.
@@ -46,7 +46,7 @@ def query_rules(function_name: str) -> str:
         return f"Lỗi khi truy vấn database: {str(e)}"
     finally:
         if conn:
-            conn.close()
+            release_db_connection(conn)
 
 # --- Các tool dự kiến mở rộng trong tương lai ---
 

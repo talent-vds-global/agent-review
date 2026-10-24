@@ -4,7 +4,7 @@ import os
 
 import psycopg2.extras
 
-from context.db import get_db_connection
+from context.db import get_db_connection, release_db_connection
 
 _SCHEMA_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "db", "analysis_table.sql")
 _schema_ready = False
@@ -34,7 +34,7 @@ def ensure_schema() -> bool:
         return False
     finally:
         if conn:
-            conn.close()
+            release_db_connection(conn)
 
 
 def _query(sql: str, params=(), one: bool = False, write: bool = False):
@@ -49,7 +49,7 @@ def _query(sql: str, params=(), one: bool = False, write: bool = False):
         rows = [dict(r) for r in rows]
         return (rows[0] if rows else None) if one else rows
     finally:
-        conn.close()
+        release_db_connection(conn)
 
 
 # ---------- trigger_runs ----------

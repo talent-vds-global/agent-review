@@ -18,12 +18,19 @@ from agent.core import run_agent
 from agent.prompt import PROMPT_POST_DEPLOY, FALLBACK_DESIGNS
 
 DEFAULT_SERVICE = "ewallet-payment-order"
+SEVERITY = {"PASS": 0, "UNKNOWN": 1, "WARN": 2, "BLOCK": 3}
 
 
 def split_verdict(conclusion: str) -> str:
     """Tách verdict từ dòng đầu tiên của kết luận agent."""
     first_line = (conclusion or "").strip().split("\n")[0].upper()
-    return "WARN" if "WARN" in first_line else ("PASS" if "PASS" in first_line else "UNKNOWN")
+    if "BLOCK" in first_line:
+        return "BLOCK"
+    if "WARN" in first_line:
+        return "WARN"
+    if "PASS" in first_line:
+        return "PASS"
+    return "UNKNOWN"
 
 
 def run_post_deploy(flow_id: str = "", trace_id: str = None, service: str = None,
@@ -131,9 +138,11 @@ Hãy đối chiếu và kết luận."""
     verdict = split_verdict(conclusion)
 
     # Luật verdict áp ở server: agent không được hạ mức khi phần tất định đã thấy vi phạm
-    if evidence and evidence["summary"]["verdict"] == "WARN" and verdict == "PASS":
-        print("[Post-deploy] Agent kết luận PASS nhưng đối chiếu tất định là WARN -> giữ WARN.")
-        verdict = "WARN"
+    if evidence:
+        det_verdict = evidence.get("summary", {}).get("verdict", "")
+        if SEVERITY.get(det_verdict, -1) > SEVERITY.get(verdict, -1):
+            print(f"[Post-deploy] Agent kết luận {verdict} nhưng đối chiếu tất định là {det_verdict} -> giữ {det_verdict}.")
+            verdict = det_verdict
 
     result_id = save_result(
         flow_id=flow_id,

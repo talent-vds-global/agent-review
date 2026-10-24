@@ -1,7 +1,7 @@
 """Module quản lý lưu trữ và truy vấn kết quả phân tích chất lượng của AI Agent."""
 
 import psycopg2.extras
-from context.db import get_db_connection
+from context.db import get_db_connection, release_db_connection
 
 
 def save_result(
@@ -61,7 +61,7 @@ def save_result(
         raise
     finally:
         if conn:
-            conn.close()
+            release_db_connection(conn)
 
 
 def get_latest_flow_result(flow_id: str) -> dict:
@@ -89,7 +89,7 @@ def get_latest_flow_result(flow_id: str) -> dict:
             return dict(row) if row else None
     finally:
         if conn:
-            conn.close()
+            release_db_connection(conn)
 
 
 def get_latest_result_per_flow() -> list:
@@ -117,7 +117,7 @@ def get_latest_result_per_flow() -> list:
             return [dict(r) for r in cur.fetchall()]
     finally:
         if conn:
-            conn.close()
+            release_db_connection(conn)
 
 
 def list_analysis_results(limit: int = 50) -> list:
@@ -144,4 +144,4 @@ def list_analysis_results(limit: int = 50) -> list:
             return [dict(r) for r in rows]
     finally:
         if conn:
-            conn.close()
+            release_db_connection(conn)

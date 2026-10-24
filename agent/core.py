@@ -43,26 +43,27 @@ def _call_model_with_retry(messages, max_retries=5):
     Chỉ thử lại với lỗi rate limit (429) hoặc server error (5xx).
     Nếu model cấu hình không tồn tại (404 model_not_found), tự động thử fallback model có sẵn.
     """
+    model = config.MODEL
     for attempt in range(max_retries):
         try:
             return client.chat.completions.create(
-                model=config.MODEL,
+                model=model,
                 messages=messages,
                 tools=tools,
                 tool_choice="auto",
                 temperature=0.2,
             )
-        except (RateLimitError, APIConnectionError, APIStatusError, Exception) as e:
+        except (RateLimitError, APIConnectionError, APIStatusError) as e:
             status_code = getattr(e, "status_code", None)
             err_str = str(e)
 
             # Nếu model không tồn tại trên endpoint/account (404 model_not_found)
             if (status_code == 404 or "model_not_found" in err_str or "does not exist" in err_str):
                 fallback_model = "openai/gpt-oss-120b"
-                if config.MODEL != fallback_model:
-                    print(f"[Warning] Model '{config.MODEL}' không khả dụng trên Groq ({err_str}), "
+                if model != fallback_model:
+                    print(f"[Warning] Model '{model}' không khả dụng trên Groq ({err_str}), "
                           f"tự động chuyển sang fallback '{fallback_model}'...")
-                    config.MODEL = fallback_model
+                    model = fallback_model
                     continue
 
             is_retryable = (

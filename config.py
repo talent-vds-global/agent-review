@@ -6,7 +6,7 @@ load_dotenv()
 
 # Cấu hình API Keys & Token
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("GROP", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("GROQ", "")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
