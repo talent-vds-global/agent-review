@@ -211,17 +211,36 @@ def detect_flow(spans: list, flow_map: dict = None) -> dict:
 # Tìm trace mới nhất của một flow
 # ==========================================================================
 
-def latest_trace_for_flow(flow_id: str, limit: int = 50, services: list = None) -> tuple:
-    """Trace mới nhất trong Jaeger **thuộc đúng flow này**.
+def flow_matches(detection: dict, flow_id: str) -> bool:
+    """Trace có chứa flow này không: là flow chính, hoặc mang flow này làm nhãn phụ (overlay)."""
+    if not detection or not flow_id:
+        return False
+    if detection.get("flow_id") == flow_id:
+        return True
+    return any(o.get("flow_id") == flow_id for o in detection.get("overlays") or [])
+
+
+# Số trace gần nhất xét ở mỗi service. Service có nhiều trace nền (db-quality quét định kỳ, poller
+# outbox) thì 50 trace đầu có thể toàn trace nền -> không thấy thì xét rộng thêm một lần.
+TRACE_SEARCH_LIMITS = (50, 300)
+
+
+def latest_trace_for_flow(flow_id: str, limit: int = None, services: list = None) -> tuple:
+    """Trace mới nhất trong Jaeger **có chứa flow này**.
 
     `sources.runtime.get_latest_trace_id()` chỉ lọc theo service nên trả trace mới nhất bất kể flow
-    — mà 6 flow dùng chung vài service, nên gần như luôn trả nhầm. Ở đây lấy các trace gần nhất của
-    những service có thể là cửa vào của flow, rồi tự nhận diện từng trace.
+    — mà 6 flow dùng chung vài service, nên gần như luôn trả nhầm. Ở đây lấy các trace gần nhất
+    của các service cửa vào rồi tự nhận diện từng trace.
+
+    Ưu tiên trace mà flow là **flow chính**. Không có thì lấy trace mang flow làm **nhãn phụ**:
+    F4a/F4c (saga bù trừ) và F5 (đuôi thông báo) chủ yếu nằm bên trong trace của F1/F2/F3 — các
+    `segments` trong mapping/F4.yaml, F5.yaml chỉ đối chiếu đúng đoạn đó của trace.
 
     Args:
         flow_id: mã flow cần tìm, vd "F3".
-        limit: số trace gần nhất lấy về từ mỗi service.
-        services: giới hạn service tìm kiếm; bỏ trống thì suy từ `entries` của flow.
+        limit: số trace gần nhất lấy về từ mỗi service; bỏ trống thì xét 50 rồi nới lên 300.
+        services: giới hạn service tìm kiếm; bỏ trống thì suy từ `entries` (và từ cửa vào của
+            các flow khác khi tìm theo nhãn phụ).
 
     Returns:
         tuple: (trace_id, detection) — ("", None) nếu không tìm thấy.
@@ -234,23 +253,43 @@ def latest_trace_for_flow(flow_id: str, limit: int = 50, services: list = None) 
     if flow is None:
         return "", None
 
-    if not services:
-        services = []
-        for matcher in flow.get("entries", []):
-            svc = matcher.get("service")
-            if svc and svc not in services:
-                services.append(svc)
+    def entry_services(flows):
+        out = []
+        for f in flows:
+            for matcher in f.get("entries", []):
+                svc = matcher.get("service")
+                if svc and svc not in out:
+                    out.append(svc)
+        return out
 
-    best_id, best_start, best_detect = "", -1, None
-    for service in services:
-        for trace in fetch_traces_of_service(service, limit=limit):
-            spans = normalize_spans(trace)
-            if not spans:
-                continue
-            detection = detect_flow(spans, fm)
-            if detection["flow_id"] != flow_id:
-                continue
-            start = min((s.get("startTime", 0) for s in trace.get("spans", [])), default=0)
-            if start > best_start:
-                best_id, best_start, best_detect = trace.get("traceID", ""), start, detection
-    return best_id, best_detect
+    own = services or entry_services([flow])
+    # Nhãn phụ nằm trong trace của flow khác -> tìm cả ở cửa vào của các flow có thể chứa nó
+    hosts = services or entry_services(
+        [f for f in fm.get("flows", []) if f.get("code") != flow_id])
+    has_overlays = bool(flow.get("overlays"))
+
+    for size in ((limit,) if limit else TRACE_SEARCH_LIMITS):
+        primary, overlay = ("", -1, None), ("", -1, None)
+        seen = set()
+        for service in own + [h for h in hosts if has_overlays and h not in own]:
+            for trace in fetch_traces_of_service(service, limit=size):
+                tid = trace.get("traceID", "")
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                spans = normalize_spans(trace)
+                if not spans:
+                    continue
+                detection = detect_flow(spans, fm)
+                if not flow_matches(detection, flow_id):
+                    continue
+                start = min((s.get("startTime", 0) for s in trace.get("spans", [])), default=0)
+                if detection["flow_id"] == flow_id:
+                    if start > primary[1]:
+                        primary = (tid, start, detection)
+                elif start > overlay[1]:
+                    overlay = (tid, start, detection)
+        best = primary if primary[0] else overlay
+        if best[0]:
+            return best[0], best[2]
+    return "", None
