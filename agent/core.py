@@ -10,6 +10,10 @@ client = OpenAI(
     base_url=config.GROQ_BASE_URL,
 )
 
+# Trần độ dài câu trả lời. Groq tính cả phần dự trữ này vào hạn mức token/phút của request,
+# nên đặt rõ thay vì để mặc định của model.
+MAX_COMPLETION_TOKENS = 1500
+
 # Khai báo tool query_rules theo định dạng OpenAI
 tools = [
     {
@@ -54,6 +58,7 @@ def _call_model_with_retry(messages, max_retries=5):
                 tools=tools,
                 tool_choice="auto",
                 temperature=0.2,
+                max_tokens=MAX_COMPLETION_TOKENS,
             )
         except (RateLimitError, APIConnectionError, APIStatusError, Exception) as e:
             status_code = getattr(e, "status_code", None)

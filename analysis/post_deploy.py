@@ -21,6 +21,10 @@ from agent.prompt import PROMPT_POST_DEPLOY
 
 DEFAULT_SERVICE = "ewallet-payment-order"
 
+# Khi đã có bảng đối chiếu, prompt chỉ kèm ngần ấy dòng đầu của danh sách span: bảng đối chiếu
+# đã chứa bằng chứng từng bước, gửi đủ cả trace (F1 ~150 span) làm request vượt hạn mức token/phút.
+RUNTIME_FLOW_PROMPT_LINES = 30
+
 # Cùng một vi phạm còn nguyên sau ngần ấy lượt liên tiếp (kể cả lượt này) thì RETRY không giải
 # quyết được nữa -> ESCALATE cho người.
 REPEAT_ESCALATE_RUNS = 3
@@ -40,6 +44,17 @@ def split_verdict(conclusion: str) -> str:
     if PASS in first_line:
         return PASS
     return "UNKNOWN"
+
+
+def _compact_runtime_flow(runtime_flow: str, max_lines: int) -> str:
+    """Giữ `max_lines` dòng đầu của danh sách span, ghi rõ số dòng đã lược."""
+    lines = (runtime_flow or "").splitlines()
+    if len(lines) <= max_lines:
+        return runtime_flow
+    return "\n".join(lines[:max_lines] + [
+        f"... (lược {len(lines) - max_lines} span; bằng chứng từng bước nằm trong phần "
+        f"KẾT QUẢ ĐỐI CHIẾU TẤT ĐỊNH bên dưới)"
+    ])
 
 
 def _repeated_violations(flow_id: str, current_keys: list) -> list:
@@ -170,14 +185,26 @@ def run_post_deploy(flow_id: str = "", trace_id: str = None, service: str = None
 {design}
 
 LUỒNG THỰC TẾ TỪ TRACE:
-{runtime_flow}
+{_compact_runtime_flow(runtime_flow, RUNTIME_FLOW_PROMPT_LINES) if evidence else runtime_flow}
 
 {to_prompt_text(evidence) if evidence else ''}
 
 Hãy đối chiếu và kết luận."""
 
     print(f"\n[Post-deploy] Đang gửi cho agent đối chiếu flow {flow_id}...")
-    conclusion = run_agent(system_prompt=PROMPT_POST_DEPLOY, user_input=user_input)
+    try:
+        conclusion = run_agent(system_prompt=PROMPT_POST_DEPLOY, user_input=user_input)
+    except Exception as e:
+        # LLM chỉ diễn giải; verdict đã có từ phần tất định. LLM lỗi (vượt hạn mức token, rate
+        # limit, mất kết nối) thì vẫn lưu verdict tất định thay vì bỏ cả lượt phân tích.
+        if not evidence:
+            raise
+        llm_error = str(e)[:500]
+        print(f"[Post-deploy] LLM lỗi, dùng verdict tất định: {llm_error}")
+        evidence["llm_error"] = llm_error
+        conclusion = (f"{evidence['summary']['verdict']}\n\n"
+                      f"_Không có diễn giải AI cho lượt này: {llm_error}_\n\n"
+                      f"Verdict lấy từ đối chiếu tất định.")
     verdict = split_verdict(conclusion)
 
     # Server-side override: agent không được hạ mức khi phần tất định đã thấy vi phạm
