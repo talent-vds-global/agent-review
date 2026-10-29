@@ -168,17 +168,19 @@ def flow_issues(flow_id: str, evidence: dict) -> list:
             service=_nfr_service(nfr), ref=nfr.get("code", ""),
         ))
 
-    # Lời gọi lỗi: gom theo (service, nhãn) để một lỗi lặp lại không thành nhiều dòng
+    # Lời gọi lỗi: gom theo (service, nhãn) để một lỗi lặp lại không thành nhiều dòng.
+    # Dùng đúng danh sách `error_calls` mà verdict đã tính (bỏ mã là kết cục nghiệp vụ của
+    # nhánh); bản ghi cũ chưa có trường này thì quay về đếm span lỗi trong bảng đối chiếu.
+    if "error_calls" in evidence:
+        error_list = evidence.get("error_calls") or []
+    else:
+        error_list = [span for step in evidence.get("steps", []) or []
+                      for span in step.get("evidence", []) or [] if span.get("error")]
+        error_list += [span for span in evidence.get("extra", []) or [] if span.get("error")]
     error_spans = {}
-    for step in evidence.get("steps", []) or []:
-        for span in step.get("evidence", []) or []:
-            if span.get("error"):
-                key = (span.get("service", ""), span.get("label", ""))
-                error_spans[key] = error_spans.get(key, 0) + 1
-    for span in evidence.get("extra", []) or []:
-        if span.get("error"):
-            key = (span.get("service", ""), span.get("label", ""))
-            error_spans[key] = error_spans.get(key, 0) + 1
+    for span in error_list:
+        key = (span.get("service", ""), span.get("label", ""))
+        error_spans[key] = error_spans.get(key, 0) + 1
     for (service, label), count in error_spans.items():
         issues.append(_issue(
             flow_id, "error_span", "high",
@@ -309,13 +311,19 @@ def _metric(mid: str, question: str, passed, value: str, detail: str, source: st
 
 
 def _build_metrics(totals: dict, issues: list, db: dict) -> list:
+    """Sáu tiêu chí kiểm chứng theo tài liệu, cùng một cách trình bày.
+
+    `value` của mọi thẻ có dạng "đạt/tổng + đơn vị" (luồng, bước, NFR, service) để đọc được
+    ngay tỉ lệ đạt; con số chi tiết (bao nhiêu lời gọi lỗi, bao nhiêu lời gọi ngoài tài liệu…)
+    nằm ở `detail`.
+    """
     analyzed = totals["flows_analyzed"]
     metrics = []
 
     metrics.append(_metric(
         "coverage", "Luồng nghiệp vụ đã được đối chiếu?",
         analyzed == totals["flows_total"] and totals["flows_total"] > 0,
-        f"{analyzed}/{totals['flows_total']} luồng",
+        f"{analyzed}/{totals['flows_total']} luồng đã đối chiếu",
         "Luồng chưa có kết quả phân tích thì mọi kết luận bên dưới chưa tính đến nó."
         if analyzed < totals["flows_total"] else
         "Mọi luồng khai báo trong flow-map đều đã có kết quả đối chiếu.",
@@ -345,38 +353,48 @@ def _build_metrics(totals: dict, issues: list, db: dict) -> list:
     ))
 
     error_issues = [i for i in issues if i["kind"] == "error_span"]
+    error_flows = {i["flow_id"] for i in error_issues}
     metrics.append(_metric(
         "errors", "Runtime không có lời gọi lỗi?",
         None if analyzed == 0 else not error_issues,
-        f"{len(error_issues)} lời gọi lỗi",
-        "; ".join(i["title"].replace("Lời gọi lỗi: ", "") for i in error_issues[:3])
-        if error_issues else "Không span giao thức nào báo lỗi trong các trace đã phân tích.",
+        f"{analyzed - len(error_flows)}/{analyzed} luồng không có lời gọi lỗi",
+        (f"{len(error_issues)} lời gọi lỗi: "
+         + "; ".join(i["title"].replace("Lời gọi lỗi: ", "") for i in error_issues[:3]))
+        if error_issues else
+        "Không lời gọi nào báo lỗi (mã là kết cục nghiệp vụ của nhánh không tính là lỗi).",
         "span có status lỗi trong trace",
     ))
 
+    drift_flows = {i["flow_id"] for i in issues if i["kind"] == "extra_call"}
     metrics.append(_metric(
         "drift", "Tài liệu còn khớp với runtime?",
         None if analyzed == 0 else totals["extra_calls"] == 0,
-        f"{totals['extra_calls']} lời gọi ngoài tài liệu",
-        "Lời gọi runtime không ánh xạ được về bước nào trong tài liệu — dấu hiệu spec drift."
-        if totals["extra_calls"] else "Không có lời gọi runtime nào nằm ngoài tài liệu.",
+        f"{analyzed - len(drift_flows)}/{analyzed} luồng khớp tài liệu",
+        f"{totals['extra_calls']} lời gọi runtime không ánh xạ được về bước nào trong tài liệu "
+        f"— dấu hiệu spec drift." if totals["extra_calls"] else
+        "Không có lời gọi runtime nào nằm ngoài tài liệu.",
         "phần `extra` của bảng đối chiếu",
     ))
 
     if db is not None:
-        available = [s for s in db.get("services", []) if s.get("available")]
+        services = db.get("services", [])
+        available = [s for s in services if s.get("available")]
         bad = [s for s in available
                if (s.get("metrics") or {}).get("n_plus_one")
                or any(str(f.get("severity", "")).upper() in ("CRITICAL", "ERROR")
                       for f in s.get("findings", []))]
+        read_note = (f" Đọc được số liệu {len(available)}/{len(services)} service."
+                     if len(available) < len(services) else "")
         metrics.append(_metric(
             "db", "Chạy tốt về database?",
             None if not available else not bad,
-            f"{len(available)}/{len(db.get('services', []))} service đọc được số liệu",
-            (f"Có phát hiện nghiêm trọng ở: {', '.join(s['service'] for s in bad)}" if bad else
-             "Không có N+1 hay phát hiện nghiêm trọng nào."
-             if available else
-             "Không gọi được dashboard db-quality của service nào."),
+            # Mẫu số là service ĐỌC ĐƯỢC số liệu: service không đọc được thì chưa kết luận
+            # được, không tính là đạt.
+            f"{len(available) - len(bad)}/{len(available)} service đạt" if available
+            else f"0/{len(services)} service đọc được số liệu",
+            (f"Có N+1 hoặc phát hiện nghiêm trọng ở: {', '.join(s['service'] for s in bad)}."
+             if bad else "Không có N+1 hay phát hiện nghiêm trọng nào.") + read_note
+            if available else "Không gọi được dashboard db-quality của service nào.",
             "database-quality-library",
         ))
 

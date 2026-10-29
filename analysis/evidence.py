@@ -713,6 +713,9 @@ def build_evidence(spec: dict, spans: list, trace_id: str = "", mapping: dict = 
         "nfrs": nfrs_out,
         "rules": rules_out,
         "extra": extra,
+        # Đúng các lời gọi tính vào tiêu chí "No error calls" — overview đọc lại danh sách này
+        # thay vì tự đếm span lỗi, để không tính nhầm mã là kết cục nghiệp vụ của nhánh
+        "error_calls": [_evidence_of(s) for s in error_calls],
     }
 
 
