@@ -5,7 +5,7 @@
       "args": ["mcp_server.py"],
       "cwd": "/đường/dẫn/tới/agent-review",
       "env": {
-        "VERIFIER_URL": "http://localhost:5000"
+        "VERIFIER_URL": "http://localhost:8000"
       }
     }
   }

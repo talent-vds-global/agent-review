@@ -44,6 +44,19 @@ _TABLE_RE = re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b")
 _GRPC_RE = re.compile(r"\bgRPC\s+`?([A-Za-z]+)`?")
 _TOPIC_RE = re.compile(r"\b[a-z]+(?:\.[a-z]+){2,}\b")
 
+PROTOCOL_TYPES = ("http", "grpc", "kafka")
+
+# Thang verdict theo tài liệu: PASS (merge/promote) < RETRY (trả vi phạm để agent sửa)
+# < ESCALATE (chuyển người quyết). LLM và server-side override đều dùng thang này.
+PASS = "PASS"
+RETRY = "RETRY"
+ESCALATE = "ESCALATE"
+VERDICT_SEVERITY = {PASS: 0, "UNKNOWN": 0, RETRY: 1, ESCALATE: 2}
+
+# Quá ngưỡng này số bước quan sát được bị MISSING thì nhiều khả năng mapping hoặc tài liệu sai
+# (trace bị cắt, đối chiếu nhầm tài liệu) chứ không phải code sai -> ESCALATE thay vì RETRY.
+MISSING_RATIO_ESCALATE = 0.5
+
 
 # ==========================================================================
 # Nạp file ánh xạ
@@ -287,7 +300,9 @@ def _detect_branch(spans: list, mapping: dict) -> dict:
     if not hits:
         return default
 
-    status = hits[0].get("status_code")
+    # Cửa vào có thể xuất hiện nhiều lần trong một trace (retry, gọi lặp): nhánh nghiệp vụ được
+    # quyết bởi lần gọi ĐẦU TIÊN, không phải span nào Jaeger trả về trước.
+    status = min(hits, key=lambda s: s["start_ms"]).get("status_code")
     branch = (cfg.get("branches") or {}).get(str(status))
     if not branch:
         return dict(default, status_code=status,
@@ -513,8 +528,11 @@ def build_evidence(spec: dict, spans: list, trace_id: str = "", mapping: dict = 
             # thống (vd 422 INSUFFICIENT_FUNDS). Không khai báo thì mọi giao dịch bị từ chối đúng
             # luật đều kéo error_rate lên ~50% và sinh cảnh báo giả.
             ignore_status = {int(x) for x in (cfg.get("ignore_status") or [])}
-            total = len([s for s in spans if s["type"] in ("http", "grpc", "kafka")])
-            failed = [s for s in spans if s["error"] and s.get("status_code") not in ignore_status]
+            # Tử số và mẫu số phải cùng một tập span: trước đây mẫu số chỉ đếm span giao thức
+            # còn tử số đếm cả span DB/nội bộ lỗi, nên tỉ lệ vượt được 100%.
+            protocol = [s for s in spans if s["type"] in PROTOCOL_TYPES]
+            total = len(protocol)
+            failed = [s for s in protocol if s["error"] and s.get("status_code") not in ignore_status]
             measured = round(len(failed) * 100.0 / total, 2) if total else 0.0
             evidence = [_evidence_of(s) for s in failed][:5]
             point = point or f"{len(failed)}/{total} span giao thức có lỗi trong trace này"
@@ -628,11 +646,28 @@ def build_evidence(spec: dict, spans: list, trace_id: str = "", mapping: dict = 
     partial_must = [s for s in steps_out if s["status"] == PARTIAL and s["severity"] == "must"]
     nfr_fail = [n for n in nfrs_out if n["status"] == "FAIL"]
 
-    verdict = "PASS"
-    if missing_must or nfr_fail:
-        verdict = "WARN"
-    elif partial_must:
-        verdict = "WARN"
+    # Lời gọi giao thức báo lỗi (tiêu chí "No error calls"). Mã HTTP là kết cục nghiệp vụ của
+    # nhánh (vd 422 INSUFFICIENT_FUNDS) hoặc đã khai `ignore_status` ở NFR thì không tính.
+    business_status = {int(x) for c in nfr_cfg.values() if isinstance(c, dict)
+                       for x in (c.get("ignore_status") or [])}
+    if branch.get("status_code") is not None:
+        business_status.add(branch["status_code"])
+    error_calls = [s for s in spans if s["type"] in PROTOCOL_TYPES and s["error"]
+                   and s.get("status_code") not in business_status]
+
+    critical_rules = [r for r in rules_out
+                      if str(r.get("severity", "")).upper() == "CRITICAL"
+                      and r["status"] in (MISSING, PARTIAL)]
+    observable = [s for s in steps_out if s["status"] in (MATCHED, PARTIAL, MISSING)]
+    missing_ratio = (len([s for s in observable if s["status"] == MISSING]) / len(observable)
+                     if observable else 0.0)
+
+    verdict, reasons = decide_verdict(
+        doc_error=spec.get("error", "") if not spec.get("steps") else "",
+        critical_rules=critical_rules, missing_ratio=missing_ratio,
+        missing_must=missing_must, partial_must=partial_must,
+        nfr_fail=nfr_fail, error_calls=error_calls,
+    )
 
     return {
         "flow_id": flow_id,
@@ -664,13 +699,53 @@ def build_evidence(spec: dict, spans: list, trace_id: str = "", mapping: dict = 
             "nfr_pass": len([n for n in nfrs_out if n["status"] == "PASS"]),
             "nfr_fail": len(nfr_fail),
             "extra_calls": len(extra),
+            "error_calls": len(error_calls),
+            "missing_ratio": round(missing_ratio, 3),
             "verdict": verdict,
+            "verdict_reasons": reasons,
+            # Khoá ổn định của từng vi phạm — so giữa các lượt để biết RETRY có sửa được không
+            "violation_keys": sorted(
+                [f"step:{x['no']}" for x in missing_must + partial_must]
+                + [f"nfr:{n['code']}" for n in nfr_fail]
+                + (["error_calls"] if error_calls else [])),
         },
         "steps": steps_out,
         "nfrs": nfrs_out,
         "rules": rules_out,
         "extra": extra,
     }
+
+
+def decide_verdict(doc_error: str, critical_rules: list, missing_ratio: float,
+                   missing_must: list, partial_must: list, nfr_fail: list,
+                   error_calls: list) -> tuple:
+    """Verdict tất định PASS / RETRY / ESCALATE, kèm lý do (mỗi lý do một dòng).
+
+    ESCALATE khi verifier không tự kết luận được hoặc lỗi không phải việc agent sửa được:
+    không đọc được tài liệu, vi phạm rule CRITICAL, hay quá nửa số bước quan sát được bị MISSING.
+    RETRY khi có vi phạm cụ thể, sửa được: bước `must` MISSING/PARTIAL, NFR FAIL, lời gọi lỗi.
+    """
+    escalate, retry = [], []
+    if doc_error:
+        escalate.append(f"Không dùng được tài liệu thiết kế: {doc_error}")
+    if critical_rules:
+        escalate.append("Vi phạm rule CRITICAL: " + ", ".join(r["code"] for r in critical_rules))
+    if missing_ratio > MISSING_RATIO_ESCALATE:
+        escalate.append(f"{missing_ratio:.0%} bước quan sát được bị MISSING (ngưỡng "
+                        f"{MISSING_RATIO_ESCALATE:.0%}) — nghi mapping/tài liệu sai hoặc trace bị cắt")
+    if missing_must:
+        retry.append("Bước bắt buộc MISSING: " + ", ".join(s["no"] for s in missing_must))
+    if partial_must:
+        retry.append("Bước bắt buộc PARTIAL: " + ", ".join(s["no"] for s in partial_must))
+    if nfr_fail:
+        retry.append("NFR vi phạm: " + ", ".join(n["code"] for n in nfr_fail))
+    if error_calls:
+        retry.append(f"{len(error_calls)} lời gọi báo lỗi")
+    if escalate:
+        return ESCALATE, escalate + retry
+    if retry:
+        return RETRY, retry
+    return PASS, []
 
 
 def to_prompt_text(evidence: dict, max_steps: int = 40) -> str:
@@ -700,6 +775,9 @@ def to_prompt_text(evidence: dict, max_steps: int = 40) -> str:
         f"· thiếu {s['missing']} · không quan sát được {s['not_observable']} "
         f"· ngoài nhánh {s['not_in_branch']}",
         f"- NFR: đạt {s['nfr_pass']} · vi phạm {s['nfr_fail']}",
+        f"- Lời gọi báo lỗi: {s.get('error_calls', 0)}",
+        f"- Verdict tất định: {s['verdict']}"
+        + (" — " + "; ".join(s.get("verdict_reasons") or []) if s.get("verdict_reasons") else ""),
         "",
         "Chi tiết từng bước:",
     ]

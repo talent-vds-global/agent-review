@@ -8,7 +8,6 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY") or os.getenv("GROQ_API_KEY_ALT", "")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
-GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
 # Cấu hình kết nối PostgreSQL
 DB_HOST = os.getenv("DB_HOST", "localhost")
@@ -48,11 +47,11 @@ def _parse_pairs(raw: str) -> dict:
     return result
 
 
-# Ánh xạ flow -> page id Confluence, ghi đè mặc định trong sources/confluence.py
+# Ánh xạ flow -> page id Confluence, ghi đè `page_id` khai trong mapping/flow-map.yaml
 # Ví dụ: CONFLUENCE_FLOW_PAGES=F1=131083,F2=131099
 CONFLUENCE_FLOW_PAGES = _parse_pairs(os.getenv("CONFLUENCE_FLOW_PAGES", ""))
 
-# Dashboard của database-quality-library (Topic #80) theo từng service.
+# Dashboard của database-quality-library theo từng service.
 # Mỗi service có một dashboard riêng; số liệu đọc trực tiếp tại thời điểm người dùng xem.
 DB_QUALITY_URLS = _parse_pairs(os.getenv("DB_QUALITY_URLS", "")) or {
     "ewallet-payment-order": "http://localhost:19082",

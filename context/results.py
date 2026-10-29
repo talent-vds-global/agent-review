@@ -20,8 +20,8 @@ def save_result(
 
     Args:
         flow_id (str): Mã luồng nghiệp vụ (ví dụ: 'F1').
-        analysis_type (str): Giai đoạn phân tích ('pre_merge' hoặc 'post_deploy').
-        verdict (str): Kết luận tổng quan ('PASS', 'WARN', hoặc 'UNKNOWN').
+        analysis_type (str): Loại phân tích ('post_deploy').
+        verdict (str): Kết luận tổng quan ('PASS', 'RETRY', 'ESCALATE' hoặc 'UNKNOWN').
         detail (str): Nội dung phân tích và giải thích chi tiết của Agent.
         runtime_flow (str, optional): Chuỗi các bước runtime trích xuất từ trace.
         trace_id (str, optional): Trace đã dùng để phân tích.
@@ -87,6 +87,28 @@ def get_latest_flow_result(flow_id: str) -> dict:
             """, (flow_id,))
             row = cur.fetchone()
             return dict(row) if row else None
+    finally:
+        if conn:
+            release_db_connection(conn)
+
+
+def get_recent_flow_results(flow_id: str, limit: int) -> list:
+    """`limit` kết quả gần nhất của một flow (mới nhất trước), chỉ verdict và tóm tắt đối chiếu.
+
+    Dùng để biết một vi phạm có lặp lại qua nhiều lượt liên tiếp không (RETRY mà không sửa được).
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute("""
+                SELECT id, verdict, evidence -> 'summary' AS summary, created_at
+                FROM analysis_results
+                WHERE flow_id = %s
+                ORDER BY created_at DESC
+                LIMIT %s;
+            """, (flow_id, limit))
+            return [dict(r) for r in cur.fetchall()]
     finally:
         if conn:
             release_db_connection(conn)

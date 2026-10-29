@@ -1,4 +1,4 @@
-"""Số liệu chất lượng database lấy từ database-quality-library (Topic #80).
+"""Số liệu chất lượng database lấy từ database-quality-library.
 
 Mỗi service có DB đều nhúng thư viện này và mở một dashboard riêng
 (`/report`, `/collected-queries`, `/slow-queries`, `/findings`).

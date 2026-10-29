@@ -15,7 +15,8 @@
 #   - Span Kafka CONSUMER nằm CÙNG trace với request gốc (context đi theo header) nên F5 chủ yếu
 #     xuất hiện dưới dạng **nhãn phụ** (overlay) của F1/F2/F3/F4, không phải flow chính.
 #
-# Kiểm bằng:  python test_flow_detect.py          (chạy trên file trace thật của ewallet-demo)
+# Mỗi flow khai `page_id` của trang tài liệu Confluence ngay tại đây — nguồn duy nhất cho ánh xạ
+# flow -> trang (ghi đè được bằng env CONFLUENCE_FLOW_PAGES khi đổi space).
 
 version: 1
 system: ewallet-demo
@@ -40,6 +41,7 @@ ignore:
 
 flows:
   - code: F1
+    page_id: "131083"        # trang Confluence của flow; tiêu đề phải mang mã [F1]
     slug: topup-partner
     title: Nạp tiền ví qua đối tác
     entries:
@@ -47,6 +49,7 @@ flows:
         http: {method: POST, route: /api/wallet/topup}
 
   - code: F2
+    page_id: "131100"        # trang Confluence của flow; tiêu đề phải mang mã [F2]
     slug: bill-telco-payment
     title: Thanh toán hoá đơn và nạp tiền điện thoại
     entries:
@@ -60,6 +63,7 @@ flows:
         http: {method: GET, route: /api/orders/bill-inquiry}    # gọi thẳng order, không qua BFF
 
   - code: F3
+    page_id: "98486"        # trang Confluence của flow; tiêu đề phải mang mã [F3]
     slug: p2p-transfer
     title: Chuyển tiền P2P giữa hai ví
     entries:
@@ -67,6 +71,7 @@ flows:
         http: {method: POST, route: /api/wallet/transfer}
 
   - code: F4
+    page_id: "131117"        # trang Confluence của flow; tiêu đề phải mang mã [F4]
     slug: failure-refund
     title: Giao dịch lỗi và hoàn tiền
     entries:
@@ -83,6 +88,7 @@ flows:
         when_span: {service: ewallet-payment-order, kind: server, http: {route: /api/orders, status: 422}}
 
   - code: F5
+    page_id: "393229"        # trang Confluence của flow; tiêu đề phải mang mã [F5]
     slug: async-notification
     title: Thông báo bất đồng bộ
     entries:
@@ -99,6 +105,7 @@ flows:
         when_span: {kafka: {topic: ewallet.payment.events.DLT}}
 
   - code: F6
+    page_id: "393246"        # trang Confluence của flow; tiêu đề phải mang mã [F6]
     slug: transaction-history
     title: Tra cứu lịch sử giao dịch
     entries:

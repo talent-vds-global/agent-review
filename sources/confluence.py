@@ -13,58 +13,66 @@ Bảng nguồn trong trang Confluence (mẫu `TPL-01-flow-spec`):
 """
 
 import html
+import os
 import re
 import requests
 from requests.auth import HTTPBasicAuth
 from bs4 import BeautifulSoup
 import config
 import html2text
+import yaml
 
-# Ánh xạ flow -> page id của space "Ewallet-demo". Ghi đè được bằng biến môi trường
-# CONFLUENCE_FLOW_PAGES (dạng "F1=131083,F2=131100"), xem config.py — cần khi đổi space.
-FLOW_PAGE_MAP = {
-    "F1": "131083",     # [F1] Nap tien vi qua doi tac
-    "F2": "131100",     # [F2] Thanh toan hoa don va nap telco
-    "F3": "98486",      # [F3] Chuyen tien P2P
-    "F4": "131117",     # [F4] Giao dich loi va hoan tien
-    "F5": "393229",     # [F5] Thong bao bat dong bo
-    "F6": "393246",     # [F6] Tra cuu lich su giao dich
-}
-FLOW_PAGE_MAP.update(config.CONFLUENCE_FLOW_PAGES)
+
+def _load_flow_pages() -> dict:
+    """flow -> page id, đọc từ `page_id` của từng flow trong `mapping/flow-map.yaml`.
+
+    Danh sách flow và trang tài liệu của nó khai ở cùng một chỗ, nên thêm flow mà quên trang thì
+    lộ ra ngay (flow không có `page_id`) thay vì lặng lẽ thiếu tài liệu. Biến môi trường
+    CONFLUENCE_FLOW_PAGES (dạng "F1=131083,F2=131100") ghi đè khi dùng space khác.
+    """
+    pages = {}
+    path = os.path.join(config.MAPPING_DIR, "flow-map.yaml")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+        for flow in data.get("flows", []):
+            if flow.get("code") and flow.get("page_id"):
+                pages[str(flow["code"])] = str(flow["page_id"])
+    except (OSError, yaml.YAMLError) as e:
+        print(f"[Confluence] Không đọc được page_id trong {path}: {e}")
+    pages.update(config.CONFLUENCE_FLOW_PAGES)
+    return pages
+
+
+FLOW_PAGE_MAP = _load_flow_pages()
+
+
+def _fetch_page(page_id: str, with_body: bool) -> tuple:
+    """GET một trang qua Confluence Cloud REST API v2. Trả (data, "") hoặc (None, thông báo lỗi)."""
+    if not config.CONFLUENCE_BASE_URL or not config.CONFLUENCE_EMAIL or not config.CONFLUENCE_TOKEN:
+        return None, "Lỗi: Chưa cấu hình đầy đủ CONFLUENCE_BASE_URL, CONFLUENCE_EMAIL, hoặc CONFLUENCE_TOKEN."
+
+    url = f"{config.CONFLUENCE_BASE_URL.rstrip('/')}/wiki/api/v2/pages/{page_id}"
+    params = {"body-format": "storage"} if with_body else None
+    auth = HTTPBasicAuth(config.CONFLUENCE_EMAIL, config.CONFLUENCE_TOKEN)
+    try:
+        response = requests.get(url, params=params, auth=auth,
+                                headers={"Accept": "application/json"}, timeout=15)
+        if response.status_code == 404:
+            return None, f"Không tìm thấy trang Confluence với page_id: {page_id}"
+        response.raise_for_status()
+        return response.json(), ""
+    except (requests.exceptions.RequestException, ValueError) as e:
+        return None, f"Lỗi khi gọi Confluence API ({url}): {e}"
 
 
 def get_page_content(page_id: str) -> str:
-    """Gọi Confluence Cloud REST API v2 để lấy nội dung trang định dạng storage (HTML/XML).
-
-    Args:
-        page_id (str): Mã định danh trang Confluence (ID).
-
-    Returns:
-        str: Chuỗi nội dung trang dạng storage, hoặc thông báo lỗi nếu không thành công.
-    """
-    if not config.CONFLUENCE_BASE_URL or not config.CONFLUENCE_EMAIL or not config.CONFLUENCE_TOKEN:
-        return "Lỗi: Chưa cấu hình đầy đủ CONFLUENCE_BASE_URL, CONFLUENCE_EMAIL, hoặc CONFLUENCE_TOKEN."
-
-    url = f"{config.CONFLUENCE_BASE_URL.rstrip('/')}/wiki/api/v2/pages/{page_id}"
-    params = {"body-format": "storage"}
-    headers = {"Accept": "application/json"}
-    auth = HTTPBasicAuth(config.CONFLUENCE_EMAIL, config.CONFLUENCE_TOKEN)
-
-    try:
-        response = requests.get(url, params=params, auth=auth, headers=headers, timeout=15)
-        if response.status_code == 404:
-            return f"Không tìm thấy trang Confluence với page_id: {page_id}"
-        response.raise_for_status()
-
-        data = response.json()
-        body_storage = data.get("body", {}).get("storage", {}).get("value", "")
-        if not body_storage:
-            return "Trang Confluence không có nội dung storage."
-        return body_storage
-    except requests.exceptions.RequestException as e:
-        return f"Lỗi khi gọi Confluence API ({url}): {str(e)}"
-    except Exception as e:
-        return f"Lỗi không xác định khi xử lý nội dung Confluence: {str(e)}"
+    """Nội dung trang dạng storage (HTML/XML), hoặc thông báo lỗi nếu không thành công."""
+    data, error = _fetch_page(page_id, with_body=True)
+    if error:
+        return error
+    body_storage = data.get("body", {}).get("storage", {}).get("value", "")
+    return body_storage or "Trang Confluence không có nội dung storage."
 
 
 def get_page_version(page_id: str) -> dict:
@@ -76,19 +84,9 @@ def get_page_version(page_id: str) -> dict:
     Returns:
         dict: {page_id, version, title, updated_at, message} — hoặc {page_id, error} khi lỗi.
     """
-    if not config.CONFLUENCE_BASE_URL or not config.CONFLUENCE_EMAIL or not config.CONFLUENCE_TOKEN:
-        return {"page_id": page_id, "error": "Chưa cấu hình CONFLUENCE_BASE_URL/EMAIL/TOKEN."}
-
-    url = f"{config.CONFLUENCE_BASE_URL.rstrip('/')}/wiki/api/v2/pages/{page_id}"
-    auth = HTTPBasicAuth(config.CONFLUENCE_EMAIL, config.CONFLUENCE_TOKEN)
-    try:
-        response = requests.get(url, auth=auth, headers={"Accept": "application/json"}, timeout=15)
-        if response.status_code == 404:
-            return {"page_id": page_id, "error": f"Không tìm thấy trang {page_id}."}
-        response.raise_for_status()
-        data = response.json()
-    except (requests.exceptions.RequestException, ValueError) as e:
-        return {"page_id": page_id, "error": f"Lỗi khi gọi Confluence API ({url}): {e}"}
+    data, error = _fetch_page(page_id, with_body=False)
+    if error:
+        return {"page_id": page_id, "error": error}
 
     version = data.get("version") or {}
     return {
@@ -341,7 +339,28 @@ def get_flow_spec(flow_id: str) -> dict:
             "properties": {}, "steps": [], "rules": [], "nfrs": [],
             "error": f"Chưa có tài liệu Confluence cho flow {flow_id}.",
         }
-    return parse_flow_spec(get_page_content(page_id), flow_id=flow_id, page_id=page_id)
+    data, error = _fetch_page(page_id, with_body=True)
+    if error:
+        return parse_flow_spec(error, flow_id=flow_id, page_id=page_id)
+
+    # Chặn cấu hình nhầm trang: tài liệu F3 mà đem đối chiếu với trace F1 thì mọi bước "thiếu"
+    # và verdict trông như lỗi code. Tiêu đề trang phải mang đúng mã flow, vd "[F1] Nap tien...".
+    title = data.get("title", "")
+    if not re.search(rf"\[\s*{re.escape(flow_id)}\s*\]", title, re.IGNORECASE):
+        return {
+            "flow_id": flow_id, "page_id": page_id, "source": f"confluence:{page_id}",
+            "title": title, "version": (data.get("version") or {}).get("number"),
+            "properties": {}, "steps": [], "rules": [], "nfrs": [],
+            "error": f"Cấu hình sai trang: trang {page_id} có tiêu đề \"{title}\", không mang mã "
+                     f"[{flow_id}]. Kiểm tra page_id của {flow_id} trong mapping/flow-map.yaml.",
+        }
+
+    body = data.get("body", {}).get("storage", {}).get("value", "")
+    spec = parse_flow_spec(body or "Trang Confluence không có nội dung storage.",
+                           flow_id=flow_id, page_id=page_id)
+    spec["title"] = title
+    spec["version"] = (data.get("version") or {}).get("number")
+    return spec
 
 
 def get_flow_design_compact(page_id: str) -> str:

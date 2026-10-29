@@ -25,7 +25,7 @@ from context.results import get_latest_result_per_flow
 from sources.dbquality import get_quality_for_services
 
 # Thứ tự xấu dần — dùng để lấy verdict tệ nhất của một nhóm flow
-VERDICT_RANK = {"PASS": 0, "UNKNOWN": 1, "WARN": 2, "FAIL": 3}
+VERDICT_RANK = {"PASS": 0, "UNKNOWN": 1, "RETRY": 2, "ESCALATE": 3}
 
 SEVERITY_RANK = {"high": 0, "medium": 1, "low": 2}
 
@@ -286,13 +286,13 @@ def _worst_verdict(verdicts: list) -> str:
 def _service_verdict(own_flows: list, own_issues: list) -> str:
     """Kết luận cho riêng một service, dựa trên vấn đề **được quy về chính nó**.
 
-    Lấy verdict xấu nhất của mọi luồng đi qua service thì sai: F1 là WARN vì một NFR ở gateway,
-    nhưng cả 7 service trong luồng đó đều hiện WARN trong khi 6 service không dính gì.
+    Lấy verdict xấu nhất của mọi luồng đi qua service thì sai: F1 là RETRY vì một NFR ở gateway,
+    nhưng cả 7 service trong luồng đó đều hiện RETRY trong khi 6 service không dính gì.
     """
     if not any(f["analyzed"] for f in own_flows):
         return "NONE"
     if any(i["severity"] in ("high", "medium") for i in own_issues):
-        return "WARN"
+        return "RETRY"
     return "PASS"
 
 
@@ -377,7 +377,7 @@ def _build_metrics(totals: dict, issues: list, db: dict) -> list:
              "Không có N+1 hay phát hiện nghiêm trọng nào."
              if available else
              "Không gọi được dashboard db-quality của service nào."),
-            "database-quality-library (Topic #80)",
+            "database-quality-library",
         ))
 
     return metrics
@@ -451,11 +451,11 @@ def build_overview(include_db: bool = False, db_timeout: float = 2.0) -> dict:
     high = sum(1 for i in issues if i["severity"] == "high")
 
     # "critical" dành cho hành vi đã sai thật (bước tài liệu không chạy, lời gọi báo lỗi,
-    # verdict FAIL). Vượt ngưỡng NFR là mức "warning" — đúng với thang PASS/WARN của verdict.
+    # flow bị ESCALATE). Vượt ngưỡng NFR là mức "warning" — tương ứng RETRY trong thang verdict.
     breaking = [i for i in issues if i["kind"] in ("missing_step", "error_span")]
     if not evaluated:
         status = "unknown"
-    elif breaking or any(f["verdict"] == "FAIL" for f in flows):
+    elif breaking or any(f["verdict"] == "ESCALATE" for f in flows):
         status = "critical"
     elif failed or high:
         status = "warning"

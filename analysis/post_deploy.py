@@ -9,31 +9,54 @@ Thứ tự xử lý: chọn trace -> **nhận diện flow** (`analysis/flow_dete
 agent diễn giải -> lưu verdict kèm bảng bằng chứng để dashboard đọc lại.
 """
 
-from analysis.evidence import build_evidence, to_prompt_text
+from analysis.evidence import (
+    build_evidence, to_prompt_text, PASS, RETRY, ESCALATE, VERDICT_SEVERITY,
+)
 from analysis.flow_detect import detect_flow, latest_trace_for_flow
-from context.results import save_result
+from context.results import save_result, get_recent_flow_results
 from sources.runtime import get_runtime_flow, get_latest_trace_id, get_spans, parse_log
-from sources.confluence import get_flow_spec, get_page_version, render_spec_text, FLOW_PAGE_MAP
+from sources.confluence import get_flow_spec, render_spec_text
 from agent.core import run_agent
-from agent.prompt import PROMPT_POST_DEPLOY, FALLBACK_DESIGNS
+from agent.prompt import PROMPT_POST_DEPLOY
 
 DEFAULT_SERVICE = "ewallet-payment-order"
-SEVERITY = {"PASS": 0, "WARN": 1, "ESCALATE": 2}
+
+# Cùng một vi phạm còn nguyên sau ngần ấy lượt liên tiếp (kể cả lượt này) thì RETRY không giải
+# quyết được nữa -> ESCALATE cho người.
+REPEAT_ESCALATE_RUNS = 3
 
 
 def split_verdict(conclusion: str) -> str:
     """Tách verdict từ dòng đầu tiên của kết luận agent.
 
-    Thứ tự ưu tiên: ESCALATE > WARN > PASS. Nếu không khớp từ khoá nào → UNKNOWN.
+    Thứ tự ưu tiên: ESCALATE > RETRY > PASS. WARN (thang cũ) được hiểu là RETRY.
+    Nếu không khớp từ khoá nào → UNKNOWN.
     """
     first_line = (conclusion or "").strip().split("\n")[0].upper()
-    if "ESCALATE" in first_line:
-        return "ESCALATE"
-    if "WARN" in first_line or "RETRY" in first_line:
-        return "WARN"
-    if "PASS" in first_line:
-        return "PASS"
+    if ESCALATE in first_line:
+        return ESCALATE
+    if RETRY in first_line or "WARN" in first_line:
+        return RETRY
+    if PASS in first_line:
+        return PASS
     return "UNKNOWN"
+
+
+def _repeated_violations(flow_id: str, current_keys: list) -> list:
+    """Khoá vi phạm có mặt ở cả lượt này lẫn (REPEAT_ESCALATE_RUNS - 1) lượt liền trước."""
+    if not current_keys:
+        return []
+    try:
+        previous = get_recent_flow_results(flow_id, REPEAT_ESCALATE_RUNS - 1)
+    except Exception as e:
+        print(f"[Post-deploy] Không đọc được lịch sử kết quả của {flow_id}: {e}")
+        return []
+    if len(previous) < REPEAT_ESCALATE_RUNS - 1:
+        return []
+    repeated = set(current_keys)
+    for row in previous:
+        repeated &= set((row.get("summary") or {}).get("violation_keys") or [])
+    return sorted(repeated)
 
 
 def run_post_deploy(flow_id: str = "", trace_id: str = None, service: str = None,
@@ -70,6 +93,15 @@ def run_post_deploy(flow_id: str = "", trace_id: str = None, service: str = None
         runtime_flow = get_runtime_flow(trace_id)
         spans = get_spans(trace_id)
     elif raw_log and raw_log.strip():
+        if not flow_id:
+            # Raw log không có span để nhận diện flow: đoán bừa "F1" thì đem log đi so với tài
+            # liệu của flow khác và verdict vô nghĩa.
+            return {
+                "status": "error",
+                "stage": "post_deploy",
+                "message": "Phân tích raw log cần truyền flow_id (log không có span để tự "
+                           "nhận diện flow).",
+            }, 400
         print("\n[Post-deploy] Đang xử lý raw log...")
         runtime_flow = parse_log(raw_log)
     else:
@@ -98,24 +130,20 @@ def run_post_deploy(flow_id: str = "", trace_id: str = None, service: str = None
                                "đối chiếu. Truyền flow_id, hoặc bổ sung cửa vào vào "
                                "mapping/flow-map.yaml.",
                 }, 422
-        elif detection["flow_id"] and detection["flow_id"] != flow_id:
-            print(f"[Post-deploy] LƯU Ý: trace được nhận diện là {detection['flow_id']} "
-                  f"nhưng người gọi yêu cầu {flow_id}.")
-    if not flow_id:
-        flow_id = "F1"      # chỉ còn đường này khi phân tích raw log, không có span để nhận diện
+        elif detection["flow_id"] != flow_id:
+            print(f"[Post-deploy] LƯU Ý: trace được nhận diện là "
+                  f"{detection['flow_id'] or detection['kind']} nhưng người gọi yêu cầu {flow_id}.")
 
-    # Tài liệu thiết kế từ Confluence — dạng có cấu trúc để đối chiếu, dạng text để đưa vào prompt
+    # Tài liệu thiết kế từ Confluence — dạng có cấu trúc để đối chiếu, dạng text để đưa vào prompt.
+    # Không đọc được tài liệu thì KHÔNG thay bằng bản dự phòng: phần đối chiếu sẽ ESCALATE.
     spec = get_flow_spec(flow_id)
     design = render_spec_text(spec)
     if spec.get("error") and not spec.get("steps"):
-        print(f"[Post-deploy] Không đọc được tài liệu Confluence: {spec['error']}")
-        design = FALLBACK_DESIGNS.get(flow_id, design)
+        print(f"[Post-deploy] Không dùng được tài liệu Confluence: {spec['error']}")
 
-    # Ghi lại phiên bản tài liệu đã dùng: khi trigger là "tài liệu đổi", báo cáo phải chỉ ra được
-    # verdict này tính trên phiên bản nào của trang.
-    spec_version = None
-    if FLOW_PAGE_MAP.get(flow_id):
-        spec_version = get_page_version(FLOW_PAGE_MAP[flow_id]).get("version")
+    # Phiên bản tài liệu đã dùng: khi trigger là "tài liệu đổi", báo cáo phải chỉ ra được verdict
+    # này tính trên phiên bản nào của trang. Lấy cùng lần gọi đọc nội dung trang.
+    spec_version = spec.get("version")
 
     # Đối chiếu tất định TRƯỚC khi gọi LLM
     evidence = build_evidence(spec, spans, trace_id=trace_id or "") if spans else None
@@ -123,6 +151,18 @@ def run_post_deploy(flow_id: str = "", trace_id: str = None, service: str = None
         evidence["detection"] = detection
         evidence["spec_version"] = spec_version
         s = evidence["summary"]
+        if detection and detection["flow_id"] != flow_id:
+            # Trace không phải của flow được yêu cầu (hoặc không nhận diện được): đối chiếu với
+            # tài liệu flow này không có nghĩa, verifier không tự kết luận được.
+            s["verdict_reasons"].insert(0, f"Trace được nhận diện là "
+                                           f"{detection['flow_id'] or detection['kind']}, "
+                                           f"khác flow được yêu cầu {flow_id}")
+            s["verdict"] = ESCALATE
+        repeated = _repeated_violations(flow_id, s.get("violation_keys") or [])
+        if repeated and s["verdict"] == RETRY:
+            s["verdict_reasons"].insert(0, f"Vi phạm lặp lại qua {REPEAT_ESCALATE_RUNS} lượt liên "
+                                           f"tiếp, RETRY không khắc phục được: {', '.join(repeated)}")
+            s["verdict"] = ESCALATE
         print(f"[Post-deploy] Đối chiếu tài liệu: khớp {s['matched']}/{s['total_steps']} bước, "
               f"thiếu {s['missing']}, NFR vi phạm {s['nfr_fail']} -> {s['verdict']}")
 
@@ -142,8 +182,7 @@ Hãy đối chiếu và kết luận."""
 
     # Server-side override: agent không được hạ mức khi phần tất định đã thấy vi phạm
     det_verdict = evidence["summary"]["verdict"] if evidence else None
-    SEVERITY = {"PASS": 0, "WARN": 1, "ESCALATE": 2}
-    if det_verdict and SEVERITY.get(det_verdict, 0) > SEVERITY.get(verdict, 0):
+    if det_verdict and VERDICT_SEVERITY.get(det_verdict, 0) > VERDICT_SEVERITY.get(verdict, 0):
         print(f"[Post-deploy] Agent kết luận {verdict} nhưng đối chiếu tất định là "
               f"{det_verdict} -> giữ {det_verdict}.")
         verdict = det_verdict

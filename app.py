@@ -10,9 +10,8 @@ import config
 from analysis.evidence import build_evidence
 from analysis.flow_detect import detect_flow, latest_trace_for_flow, list_flows
 from analysis.overview import build_overview
-from analysis.post_deploy import run_post_deploy, split_verdict
+from analysis.post_deploy import run_post_deploy
 from context.results import get_latest_flow_result, list_analysis_results
-from sources.github import get_pr_diff
 from sources.runtime import (
     get_latest_trace_id, get_spans, get_timeline,
     fetch_trace, build_timeline, trace_window_us,
@@ -20,8 +19,6 @@ from sources.runtime import (
 from sources.logs import get_trace_logs
 from sources.confluence import get_flow_spec, FLOW_PAGE_MAP
 from sources.dbquality import get_quality_for_services
-from agent.core import run_agent
-from agent.prompt import PROMPT_PRE_MERGE
 from triggers import jobs, scheduler, store as trigger_store
 from triggers.confluence_watch import check_pages, flow_of_page
 
@@ -42,7 +39,6 @@ def index():
         "service": "Software Quality AI Agent",
         "status": "running",
         "endpoints": {
-            "pre_merge": "POST /webhook",
             "post_deploy": "POST /runtime",
             "list_analysis": "GET /api/analysis",
             "list_flows": "GET /api/flows",
@@ -64,10 +60,27 @@ def index():
 
 # ========== API cho Dashboard ==========
 
+def _limit_arg(default: int, maximum: int = 500):
+    """Đọc `?limit=`: trả (giá trị, None) hoặc (None, response 400) khi không phải số nguyên dương."""
+    raw = request.args.get("limit")
+    if raw is None or raw == "":
+        return default, None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        return None, (jsonify({"error": f"Tham số limit phải là số nguyên dương, nhận '{raw}'."}), 400)
+    return min(value, maximum), None
+
+
 @app.route("/api/analysis", methods=["GET"])
 def list_analysis():
     """Trả danh sách tất cả kết quả phân tích, mới nhất trước."""
-    return jsonify(list_analysis_results(limit=int(request.args.get("limit", 50))))
+    limit, err = _limit_arg(50)
+    if err:
+        return err
+    return jsonify(list_analysis_results(limit=limit))
 
 
 @app.route("/api/flows", methods=["GET"])
@@ -219,54 +232,6 @@ def db_quality():
     return jsonify(get_quality_for_services(services))
 
 
-# ========== Luồng 1: Pre-merge (GitHub Webhook) ==========
-
-@app.route("/webhook", methods=["POST"])
-def github_webhook():
-    """Luồng 1: Pre-merge (GitHub Webhook)."""
-    payload = request.get_json(silent=True)
-    if not payload:
-        return jsonify({"error": "Payload không hợp lệ (không phải JSON)"}), 400
-
-    action = payload.get("action")
-    if action not in ["opened", "synchronize", "reopened"]:
-        return jsonify({"message": f"Bỏ qua action '{action}'."}), 200
-
-    pull_request = payload.get("pull_request")
-    repository = payload.get("repository")
-    if not pull_request or not repository:
-        return jsonify({"error": "Thiếu dữ liệu pull_request hoặc repository"}), 400
-
-    repo_full_name = repository.get("full_name")
-    pr_number = pull_request.get("number")
-    pr_title = pull_request.get("title", "")
-
-    print(f"\n[Pre-merge] Đang xử lý PR #{pr_number} ({pr_title}) trên repo {repo_full_name}...")
-
-    pr_diff = get_pr_diff(repo_full_name, pr_number)
-    user_input = (
-        f"Thông tin Pull Request:\n"
-        f"- Repository: {repo_full_name}\n"
-        f"- PR Number: #{pr_number}\n"
-        f"- Tiêu đề: {pr_title}\n"
-        f"- Action: {action}\n\n"
-        f"Nội dung Code Diff:\n{pr_diff}"
-    )
-    conclusion = run_agent(system_prompt=PROMPT_PRE_MERGE, user_input=user_input)
-    verdict = split_verdict(conclusion)
-
-    print("\n========== KẾT LUẬN PRE-MERGE ==========")
-    print(conclusion)
-    print("========================================\n")
-
-    return jsonify({
-        "status": "success", "stage": "pre_merge",
-        "repo": repo_full_name, "pr_number": pr_number,
-        "verdict": verdict,
-        "conclusion": conclusion
-    }), 200
-
-
 # ========== Luồng 2: Post-deploy (Runtime Trace / Log Monitoring) ==========
 
 @app.route("/runtime", methods=["POST"])
@@ -315,11 +280,14 @@ def _requested_flows(payload: dict) -> list:
 def triggers_status():
     """Trạng thái các trigger: lịch hằng ngày (lần chạy tới), polling Confluence, hàng đợi,
     phiên bản tài liệu đang theo dõi và các lượt chạy gần nhất."""
+    limit, err = _limit_arg(20)
+    if err:
+        return err
     return jsonify({
         "scheduler": scheduler.status(),
         "queue": jobs.status(),
         "spec_versions": list(trigger_store.get_spec_versions().values()),
-        "runs": trigger_store.list_runs(limit=int(request.args.get("limit", 20))),
+        "runs": trigger_store.list_runs(limit=limit),
     })
 
 

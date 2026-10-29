@@ -43,6 +43,16 @@ def enqueue(flow_ids: list, triggered_by: str, reason: str = "") -> int:
     return run_id
 
 
+def requeue(run_id: int, flow_ids: list, triggered_by: str) -> None:
+    """Xếp lại một lượt đã có trong DB (lượt dở dang từ lần chạy server trước)."""
+    key = (triggered_by, tuple(flow_ids))
+    with _lock:
+        _pending[key] = run_id
+    _queue.put((run_id, key, list(flow_ids), triggered_by))
+    print(f"[Trigger] Xếp lại lượt dở #{run_id} ({triggered_by}): {', '.join(flow_ids)}")
+    start_worker()
+
+
 def status() -> dict:
     return {
         "queued": _queue.qsize(),

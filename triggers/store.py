@@ -90,15 +90,20 @@ def last_run_at(triggered_by: str):
     return row["created_at"] if row else None
 
 
-def fail_stale_runs() -> int:
-    """Lượt chạy còn treo ở queued/running từ lần chạy server trước sẽ không bao giờ xong
-    (hàng đợi nằm trong bộ nhớ) — đánh dấu failed để dashboard không hiện "đang chạy" mãi."""
-    rows = _query("""
-        UPDATE trigger_runs SET status = 'failed', finished_at = NOW(),
-               results = COALESCE(results, '[]'::jsonb)
-        WHERE status IN ('queued', 'running') RETURNING id;
+def reset_stale_runs() -> list:
+    """Lượt chạy còn treo ở queued/running từ lần chạy server trước (hàng đợi nằm trong bộ nhớ
+    nên đã mất). Đưa về `queued` để xếp lại vào hàng đợi; kết quả dở dang được xoá vì lượt chạy
+    lại từ đầu.
+
+    Returns:
+        list[dict]: [{id, triggered_by, flow_ids}] theo thứ tự tạo.
+    """
+    return _query("""
+        UPDATE trigger_runs SET status = 'queued', started_at = NULL, finished_at = NULL,
+               results = NULL
+        WHERE status IN ('queued', 'running')
+        RETURNING id, triggered_by, flow_ids, created_at;
     """, write=True)
-    return len(rows)
 
 
 # ---------- spec_versions ----------
