@@ -84,17 +84,17 @@ def _call_model_with_retry(messages, max_retries=5):
 
 
 def run_agent(system_prompt: str, user_input: str) -> str:
-    """Vòng lặp Agent core dùng chung cho cả hai luồng Pre-merge và Post-deploy.
+    """Vòng lặp Agent core của Luồng Post-deploy.
 
     Khởi tạo ngữ cảnh hội thoại, gọi Groq API (OpenAI-compatible) với function calling,
     thực thi tools từ context/tools.py và phản hồi cho model đến khi đưa ra kết luận.
 
     Args:
-        system_prompt (str): System prompt quy định vai trò (Pre-merge hoặc Post-deploy).
-        user_input (str): Dữ liệu đầu vào (Code diff từ PR hoặc Runtime log đã parse).
+        system_prompt (str): System prompt quy định vai trò.
+        user_input (str): Dữ liệu đầu vào (trace/log runtime và kết quả đối chiếu tất định).
 
     Returns:
-        str: Kết luận đánh giá cuối cùng của Agent (PASS / WARN kèm giải thích).
+        str: Kết luận đánh giá cuối cùng của Agent (PASS / RETRY / ESCALATE kèm giải thích).
     """
     messages = [
         {"role": "system", "content": system_prompt},

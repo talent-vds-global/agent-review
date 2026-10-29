@@ -124,9 +124,11 @@ def start() -> bool:
     if _thread is not None and _thread.is_alive():
         return True
     if store.ensure_schema():
-        stale = store.fail_stale_runs()
+        stale = sorted(store.reset_stale_runs(), key=lambda r: r["created_at"])
         if stale:
-            print(f"[Scheduler] Đánh dấu failed {stale} lượt chạy dở từ lần chạy trước.")
+            print(f"[Scheduler] Chạy lại {len(stale)} lượt dở từ lần chạy server trước.")
+        for run in stale:
+            jobs.requeue(run["id"], run["flow_ids"], run["triggered_by"])
     _state["started_at"] = datetime.now(timezone.utc).isoformat()
     _thread = threading.Thread(target=_loop, name="vq-scheduler", daemon=True)
     _thread.start()

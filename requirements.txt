@@ -9,4 +9,4 @@ beautifulsoup4
 pyyaml
 openai
 tzdata
-mcp[cli]
+mcp[cli]>=1.2,<2   # mcp 2.x đổi FastMCP thành MCPServer; mcp_server.py viết cho API 1.x

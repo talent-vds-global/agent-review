@@ -2,8 +2,8 @@
 CREATE TABLE IF NOT EXISTS analysis_results (
     id SERIAL PRIMARY KEY,
     flow_id TEXT NOT NULL,           -- vd: F1
-    analysis_type TEXT NOT NULL,     -- 'pre_merge' hoặc 'post_deploy'
-    verdict TEXT NOT NULL,           -- PASS / WARN
+    analysis_type TEXT NOT NULL,     -- 'post_deploy'
+    verdict TEXT NOT NULL,           -- PASS / RETRY / ESCALATE
     detail TEXT,                     -- kết luận đầy đủ của agent
     runtime_flow TEXT,               -- chuỗi bước runtime (post-deploy)
     trace_id TEXT,                   -- trace đã dùng để phân tích (mở lại được ở tab Sơ đồ trace)
@@ -48,3 +48,9 @@ CREATE TABLE IF NOT EXISTS spec_versions (
     checked_at TIMESTAMPTZ DEFAULT NOW(),
     changed_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+-- ========== Thang verdict PASS / RETRY / ESCALATE ==========
+-- Thang cũ PASS / WARN: WARN chính là "có vi phạm cần sửa" -> RETRY. Chạy lại nhiều lần vô hại.
+UPDATE analysis_results SET verdict = 'RETRY' WHERE verdict = 'WARN';
+UPDATE analysis_results SET evidence = jsonb_set(evidence, '{summary,verdict}', '"RETRY"')
+    WHERE evidence -> 'summary' ->> 'verdict' = 'WARN';

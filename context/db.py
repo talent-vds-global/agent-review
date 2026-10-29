@@ -25,7 +25,20 @@ def get_db_connection():
 
 
 def release_db_connection(conn):
-    """Trả kết nối về lại connection pool."""
-    if conn and _pool:
-        _pool.putconn(conn)
+    """Trả kết nối về lại connection pool, luôn ở trạng thái sạch.
+
+    psycopg2 tự mở transaction ở câu lệnh đầu tiên. Nếu câu lệnh lỗi mà không rollback, kết nối
+    trả về pool còn kẹt ở trạng thái "transaction aborted" và mọi truy vấn sau dùng lại nó đều
+    lỗi; câu SELECT không commit thì để lại "idle in transaction". Rollback ở đây xử lý cả hai
+    (sau commit thì rollback không làm gì). Kết nối đã hỏng thì đóng hẳn thay vì trả lại pool.
+    """
+    if not conn or not _pool:
+        return
+    broken = bool(conn.closed)
+    if not broken:
+        try:
+            conn.rollback()
+        except Exception:
+            broken = True
+    _pool.putconn(conn, close=broken)
 

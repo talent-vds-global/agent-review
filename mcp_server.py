@@ -1,13 +1,14 @@
 """MCP Server — bọc REST API của Runtime Verifier thành MCP tool.
 
-Cho phép bất kỳ coding agent nào (Claude Code, Cursor, Cline, …) gọi verify_runtime như một bước
-trong vòng lặp harness: agent viết code → deploy → gọi verify_runtime → nhận PASS/WARN → quyết
-định sửa hay chuyển bước tiếp.
+Runtime Verifier là hệ thống kiểm chứng độc lập, chạy bên ngoài vòng lặp của coding agent (kích
+hoạt theo sự kiện, theo lịch hoặc thủ công). MCP tool này mở thêm một cửa để agent hoặc người dùng
+chủ động yêu cầu kiểm chứng và đọc kết quả: PASS (đạt), RETRY (có vi phạm cần sửa, kèm danh sách)
+hoặc ESCALATE (cần người quyết).
 
 Chạy:
     python mcp_server.py                         # stdio (mặc định, dùng với agent)
     python mcp_server.py --transport sse          # SSE  (dùng với dashboard/web)
-    VERIFIER_URL=http://10.0.0.5:5000 python mcp_server.py   # trỏ sang server khác
+    VERIFIER_URL=http://10.0.0.5:8000 python mcp_server.py   # trỏ sang server khác
 
 Cấu hình agent (ví dụ claude_desktop_config.json):
     {
@@ -15,7 +16,7 @@ Cấu hình agent (ví dụ claude_desktop_config.json):
         "runtime-verifier": {
           "command": "python",
           "args": ["/đường/dẫn/tới/mcp_server.py"],
-          "env": { "VERIFIER_URL": "http://localhost:5000" }
+          "env": { "VERIFIER_URL": "http://localhost:8000" }
         }
       }
     }
@@ -33,16 +34,13 @@ from mcp.server.fastmcp import FastMCP
 # Cấu hình
 # ---------------------------------------------------------------------------
 
-VERIFIER_URL = os.getenv("VERIFIER_URL", "http://localhost:5000")
+VERIFIER_URL = os.getenv("VERIFIER_URL", "http://localhost:8000")
 
 # ---------------------------------------------------------------------------
 # Khởi tạo MCP server
 # ---------------------------------------------------------------------------
 
-mcp = FastMCP(
-    name="runtime-verifier",
-    version="0.1.0",
-)
+mcp = FastMCP(name="runtime-verifier")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -74,12 +72,19 @@ def _get(path: str, params: dict | None = None) -> dict:
         return {"error": str(e)}
 
 
+VERDICT_ICON = {"PASS": "✅", "RETRY": "🔁", "ESCALATE": "🚨"}
+
+
+def _icon(verdict: str) -> str:
+    return VERDICT_ICON.get(str(verdict).upper(), "—")
+
+
 def _format_verdict(result: dict) -> str:
-    """Định dạng kết quả verify thành text dễ đọc cho agent."""
+    """Định dạng kết quả `POST /runtime` thành text dễ đọc cho agent."""
     if "error" in result:
         return f"❌ Lỗi: {result['error']}"
 
-    body = result.get("body", {})
+    body = result.get("body") or {}
     code = result.get("status_code", 0)
 
     if code != 200:
@@ -87,47 +92,39 @@ def _format_verdict(result: dict) -> str:
         return f"⚠️ Verifier trả HTTP {code}: {msg}"
 
     verdict = body.get("verdict", "UNKNOWN")
-    flow_id = body.get("flow_id", "?")
-    trace_id = body.get("trace_id", "?")
-    spec_ver = body.get("spec_version", "?")
-
     lines = [
-        f"{'✅' if verdict == 'PASS' else '🔴'} Verdict: **{verdict}**",
-        f"Flow: {flow_id} | Trace: {trace_id} | Spec version: {spec_ver}",
+        f"{_icon(verdict)} Verdict: **{verdict}**",
+        f"Flow: {body.get('flow_id', '?')} | Trace: {body.get('trace_id', '?')} | "
+        f"Spec version: {body.get('spec_version', '?')}",
     ]
 
-    # Tóm tắt evidence
-    evidence = body.get("evidence", {})
-    summary = evidence.get("summary", {})
+    evidence = body.get("evidence") or {}
+    summary = evidence.get("summary") or {}
     if summary:
-        det_verdict = summary.get("verdict", "")
-        matched = summary.get("matched", 0)
-        total = summary.get("total", 0)
-        missing = summary.get("missing", 0)
-        lines.append(f"Evidence: {matched}/{total} bước MATCHED, {missing} MISSING "
-                      f"(deterministic verdict: {det_verdict})")
+        lines.append(
+            f"Đối chiếu: {summary.get('matched', 0)}/{summary.get('total_steps', 0)} bước MATCHED, "
+            f"{summary.get('partial', 0)} PARTIAL, {summary.get('missing', 0)} MISSING, "
+            f"{summary.get('error_calls', 0)} lời gọi lỗi "
+            f"(verdict tất định: {summary.get('verdict', '?')})"
+        )
+        reasons = summary.get("verdict_reasons") or []
+        if reasons:
+            lines.append("Lý do / vi phạm:")
+            lines.extend(f"  - {r}" for r in reasons)
 
-    # Tóm tắt NFR
-    nfr = evidence.get("nfr", {})
-    if nfr:
-        nfr_lines = []
-        for nfr_id, nfr_data in nfr.items():
-            if isinstance(nfr_data, dict) and "value" in nfr_data:
-                val = nfr_data["value"]
-                unit = nfr_data.get("unit", "")
-                nfr_lines.append(f"  {nfr_id}: {val}{unit}")
-        if nfr_lines:
-            lines.append("NFR measurements:")
-            lines.extend(nfr_lines)
+    nfr_lines = [
+        f"  [{n.get('status', '?')}] {n.get('code', '?')}: {n.get('measured')} "
+        f"(ngưỡng {n.get('operator', '')} {n.get('threshold', '')} {n.get('unit', '')})".rstrip()
+        for n in evidence.get("nfrs") or [] if isinstance(n, dict)
+    ]
+    if nfr_lines:
+        lines.append("NFR:")
+        lines.extend(nfr_lines)
 
-    # Diễn giải LLM (rút gọn)
-    interpretation = body.get("interpretation", "")
-    if interpretation:
-        # Lấy 500 ký tự đầu
-        short = interpretation[:500]
-        if len(interpretation) > 500:
-            short += "…"
-        lines.append(f"\nLLM Interpretation:\n{short}")
+    conclusion = body.get("conclusion", "")
+    if conclusion:
+        short = conclusion[:1500] + ("…" if len(conclusion) > 1500 else "")
+        lines.append(f"\nDiễn giải của LLM:\n{short}")
 
     return "\n".join(lines)
 
@@ -146,9 +143,9 @@ def verify_runtime(
     """Xác minh hành vi runtime của hệ thống bằng cách đối chiếu trace thực tế với tài liệu thiết kế.
 
     Công cụ này kéo trace từ Jaeger và spec từ Confluence, chạy đối chiếu tất định (deterministic
-    evidence matching) rồi diễn giải bằng LLM, trả verdict PASS hoặc WARN.
+    evidence matching) rồi diễn giải bằng LLM, trả verdict PASS / RETRY / ESCALATE.
 
-    Dùng sau khi deploy để kiểm tra hệ thống chạy đúng thiết kế hay không.
+    Dùng để kiểm tra hệ thống đang chạy có đúng tài liệu thiết kế hay không.
 
     Args:
         flow_id: Mã luồng nghiệp vụ cần kiểm tra (ví dụ "F1"). Nếu bỏ trống, verifier tự detect
@@ -159,7 +156,8 @@ def verify_runtime(
         operation: Tên operation để lọc trace. Tuỳ chọn.
 
     Returns:
-        Kết quả xác minh gồm verdict (PASS/WARN), bảng evidence, đo lường NFR và diễn giải.
+        Kết quả xác minh gồm verdict (PASS/RETRY/ESCALATE), danh sách vi phạm, đo lường NFR và
+        diễn giải.
     """
     payload = {}
     if flow_id:
@@ -239,7 +237,7 @@ def get_latest_result(flow_id: str) -> str:
     triggered_by = latest.get("triggered_by", "?")
 
     return (
-        f"{'✅' if verdict == 'PASS' else '🔴'} Flow {flow_id}: **{verdict}**\n"
+        f"{_icon(verdict)} Flow {flow_id}: **{verdict}**\n"
         f"Thời gian: {created}\n"
         f"Trace: {trace_id}\n"
         f"Triggered by: {triggered_by}"
@@ -267,9 +265,8 @@ def get_system_overview() -> str:
     for f in flows:
         fid = f.get("flow_id", "?")
         title = f.get("title", "")
-        verdict = f.get("latest_verdict", "—")
-        icon = "✅" if verdict == "PASS" else ("🔴" if verdict == "WARN" else "—")
-        lines.append(f"  {icon} {fid} ({title}): {verdict}")
+        verdict = f.get("verdict") or "NONE"
+        lines.append(f"  {_icon(verdict)} {fid} ({title}): {verdict}")
 
     return "\n".join(lines)
 
