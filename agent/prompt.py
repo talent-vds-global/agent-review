@@ -67,7 +67,7 @@ Kết luận ESCALATE (chuyển người quyết) nếu có BẤT KỲ điều k
 - Trace không thuộc đúng flow được yêu cầu, hoặc không nhận diện được flow
 - Ít nhất 1 business rule có severity CRITICAL bị vi phạm
 - Quá 50% số bước quan sát được là MISSING (nghi mapping/tài liệu sai hoặc trace bị cắt)
-- Cùng một vi phạm lặp lại qua nhiều lượt liên tiếp (RETRY không khắc phục được)
+- Cùng một vi phạm lặp lại qua nhiều trace (giao dịch) khác nhau liên tiếp (RETRY không khắc phục được)
 
 Kết luận RETRY (trả danh sách vi phạm để sửa) nếu không ESCALATE và có BẤT KỲ điều kiện nào sau:
 - Ít nhất 1 bước MISSING hoặc PARTIAL nằm trên luồng chính (main flow), không phải nhánh phụ
