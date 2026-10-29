@@ -102,7 +102,7 @@ def get_recent_flow_results(flow_id: str, limit: int) -> list:
         conn = get_db_connection()
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute("""
-                SELECT id, verdict, evidence -> 'summary' AS summary, created_at
+                SELECT id, verdict, trace_id, evidence -> 'summary' AS summary, created_at
                 FROM analysis_results
                 WHERE flow_id = %s
                 ORDER BY created_at DESC

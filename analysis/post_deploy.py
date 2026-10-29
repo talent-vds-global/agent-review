@@ -25,9 +25,12 @@ DEFAULT_SERVICE = "ewallet-payment-order"
 # đã chứa bằng chứng từng bước, gửi đủ cả trace (F1 ~150 span) làm request vượt hạn mức token/phút.
 RUNTIME_FLOW_PROMPT_LINES = 30
 
-# Cùng một vi phạm còn nguyên sau ngần ấy lượt liên tiếp (kể cả lượt này) thì RETRY không giải
-# quyết được nữa -> ESCALATE cho người.
+# Cùng một vi phạm còn nguyên qua ngần ấy TRACE KHÁC NHAU liên tiếp (kể cả trace này) thì RETRY
+# không giải quyết được nữa -> ESCALATE cho người. Chỉ đếm trace khác nhau: phân tích lại đúng một
+# trace thì kết quả tất nhiên không đổi, không nói lên được việc sửa có ăn thua hay không.
 REPEAT_ESCALATE_RUNS = 3
+# Số kết quả gần nhất đọc lại để tìm đủ (REPEAT_ESCALATE_RUNS - 1) trace trước đó
+REPEAT_HISTORY_LIMIT = 50
 
 
 def split_verdict(conclusion: str) -> str:
@@ -57,15 +60,29 @@ def _compact_runtime_flow(runtime_flow: str, max_lines: int) -> str:
     ])
 
 
-def _repeated_violations(flow_id: str, current_keys: list) -> list:
-    """Khoá vi phạm có mặt ở cả lượt này lẫn (REPEAT_ESCALATE_RUNS - 1) lượt liền trước."""
+def _repeated_violations(flow_id: str, current_keys: list, trace_id: str = "") -> list:
+    """Khoá vi phạm có mặt ở trace này lẫn (REPEAT_ESCALATE_RUNS - 1) trace liền trước.
+
+    Mỗi trace chỉ tính kết quả mới nhất của nó; các lượt phân tích lại trên trace đang xét hoặc
+    trên một trace đã tính thì bỏ qua.
+    """
     if not current_keys:
         return []
     try:
-        previous = get_recent_flow_results(flow_id, REPEAT_ESCALATE_RUNS - 1)
+        rows = get_recent_flow_results(flow_id, REPEAT_HISTORY_LIMIT)
     except Exception as e:
         print(f"[Post-deploy] Không đọc được lịch sử kết quả của {flow_id}: {e}")
         return []
+    seen = {trace_id} if trace_id else set()
+    previous = []
+    for row in rows:                       # mới nhất trước
+        tid = row.get("trace_id") or ""
+        if not tid or tid in seen:
+            continue
+        seen.add(tid)
+        previous.append(row)
+        if len(previous) == REPEAT_ESCALATE_RUNS - 1:
+            break
     if len(previous) < REPEAT_ESCALATE_RUNS - 1:
         return []
     repeated = set(current_keys)
@@ -175,9 +192,9 @@ def run_post_deploy(flow_id: str = "", trace_id: str = None, service: str = None
                                            f"{detection['flow_id'] or detection['kind']}, "
                                            f"khác flow được yêu cầu {flow_id}")
             s["verdict"] = ESCALATE
-        repeated = _repeated_violations(flow_id, s.get("violation_keys") or [])
+        repeated = _repeated_violations(flow_id, s.get("violation_keys") or [], trace_id or "")
         if repeated and s["verdict"] == RETRY:
-            s["verdict_reasons"].insert(0, f"Vi phạm lặp lại qua {REPEAT_ESCALATE_RUNS} lượt liên "
+            s["verdict_reasons"].insert(0, f"Vi phạm lặp lại qua {REPEAT_ESCALATE_RUNS} trace liên "
                                            f"tiếp, RETRY không khắc phục được: {', '.join(repeated)}")
             s["verdict"] = ESCALATE
         print(f"[Post-deploy] Đối chiếu tài liệu: khớp {s['matched']}/{s['total_steps']} bước, "
