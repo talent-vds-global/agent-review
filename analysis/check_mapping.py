@@ -16,7 +16,7 @@ import re
 import sys
 
 from analysis.evidence import build_evidence, to_prompt_text
-from analysis.flow_detect import detect_flow, latest_trace_for_flow, load_flow_map
+from analysis.flow_detect import detect_flow, flow_matches, latest_trace_for_flow, load_flow_map
 from sources.confluence import get_flow_spec
 from sources.runtime import get_latest_trace_id, get_spans
 
@@ -89,7 +89,7 @@ def main(argv: list) -> int:
             print("Không nhận diện được flow của trace này nên không có tài liệu để đối chiếu. "
                   "Chỉ rõ flow: python -m analysis.check_mapping F1 " + trace_id)
             return 1
-    elif detection["flow_id"] and detection["flow_id"] != flow_id:
+    elif detection["flow_id"] and not flow_matches(detection, flow_id):
         print(f"[flow ] LƯU Ý: trace được nhận diện là {detection['flow_id']} nhưng đang ép dùng "
               f"mapping {flow_id}.")
 

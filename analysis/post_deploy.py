@@ -12,7 +12,7 @@ agent diễn giải -> lưu verdict kèm bảng bằng chứng để dashboard �
 from analysis.evidence import (
     build_evidence, to_prompt_text, PASS, RETRY, ESCALATE, VERDICT_SEVERITY,
 )
-from analysis.flow_detect import detect_flow, latest_trace_for_flow
+from analysis.flow_detect import detect_flow, flow_matches, latest_trace_for_flow
 from context.results import save_result, get_recent_flow_results
 from sources.runtime import get_runtime_flow, get_latest_trace_id, get_spans, parse_log
 from sources.confluence import get_flow_spec, render_spec_text
@@ -145,7 +145,7 @@ def run_post_deploy(flow_id: str = "", trace_id: str = None, service: str = None
                                "đối chiếu. Truyền flow_id, hoặc bổ sung cửa vào vào "
                                "mapping/flow-map.yaml.",
                 }, 422
-        elif detection["flow_id"] != flow_id:
+        elif not flow_matches(detection, flow_id):
             print(f"[Post-deploy] LƯU Ý: trace được nhận diện là "
                   f"{detection['flow_id'] or detection['kind']} nhưng người gọi yêu cầu {flow_id}.")
 
@@ -166,7 +166,9 @@ def run_post_deploy(flow_id: str = "", trace_id: str = None, service: str = None
         evidence["detection"] = detection
         evidence["spec_version"] = spec_version
         s = evidence["summary"]
-        if detection and detection["flow_id"] != flow_id:
+        # Flow khớp qua nhãn phụ (vd F5 là đuôi thông báo trong trace F1) là hợp lệ: segments
+        # trong mapping chỉ đối chiếu đúng đoạn đó của trace.
+        if detection and not flow_matches(detection, flow_id):
             # Trace không phải của flow được yêu cầu (hoặc không nhận diện được): đối chiếu với
             # tài liệu flow này không có nghĩa, verifier không tự kết luận được.
             s["verdict_reasons"].insert(0, f"Trace được nhận diện là "
